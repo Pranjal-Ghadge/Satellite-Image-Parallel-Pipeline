@@ -1,0 +1,3 @@
+C:/Users/PRANJAL GHADGE/Satellite-Image-Parallel-Pipeline/build-ninja/CMakeFiles/parallel_pipeline.dir
+C:/Users/PRANJAL GHADGE/Satellite-Image-Parallel-Pipeline/build-ninja/CMakeFiles/edit_cache.dir
+C:/Users/PRANJAL GHADGE/Satellite-Image-Parallel-Pipeline/build-ninja/CMakeFiles/rebuild_cache.dir

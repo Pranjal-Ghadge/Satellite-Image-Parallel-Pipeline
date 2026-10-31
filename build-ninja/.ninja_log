@@ -1,0 +1,8 @@
+# ninja log v7
+26	2173	8151799228764612	CMakeFiles/parallel_pipeline.dir/src/cpu_openmp.cpp.obj	22a18172b8b41c51
+18	2182	8151799228683839	CMakeFiles/parallel_pipeline.dir/src/cpu_sequential.cpp.obj	9ec64a78f6e97a5
+5	2188	8151799228553863	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	6c1c2823e2c2ab22
+11	2202	8151799228603864	CMakeFiles/parallel_pipeline.dir/src/utils.cpp.obj	67924b4b60468904
+34	5898	8151799228841617	CMakeFiles/parallel_pipeline.dir/src/gpu_cuda.cu.obj	f918fbb6c4440ec5
+5900	6225	8151799287492829	CMakeFiles/parallel_pipeline.dir/cmake_device_link.obj	3cf863135c522c0b
+6226	6892	8151799290749179	parallel_pipeline.exe	8463bbccd4c8ba7

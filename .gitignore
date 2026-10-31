@@ -1,0 +1,16 @@
+# Build & IDE directories
+build/
+bin/
+.vscode/
+.idea/
+
+# Binaries & Object Files
+*.exe
+*.o
+*.obj
+*.out
+
+# Generated Outputs
+data/output/*
+docs/*.csv
+!.gitignore
