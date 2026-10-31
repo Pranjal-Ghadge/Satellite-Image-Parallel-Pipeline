@@ -2,6 +2,7 @@ import csv
 import os
 import subprocess
 import uuid
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +41,8 @@ class PipelineRequest(BaseModel):
     resolution: str = Field(default="1024x1024", pattern=r"^(512x512|1024x1024|4096x4096)$")
     threads: int = Field(default=8, ge=1, le=64)
     enable_cuda: bool = False
+    gaussian_kernel: int = Field(default=5, ge=3, le=7)
+    omp_schedule: str = Field(default="dynamic", pattern=r"^(static|dynamic)$")
 
 
 def cuda_build_is_enabled() -> bool:
@@ -55,6 +58,40 @@ def cuda_build_is_enabled() -> bool:
                 enabled_values.add(value == "TRUE" or value == "ON" or value == "1" or value == "YES")
 
     return bool(enabled_values) and any(enabled_values)
+
+
+def calculate_speedups_from_stdout(stdout: str) -> dict:
+    """Parse runtime blocks emitted by utils.cpp and calculate Sp values."""
+    runtimes = {}
+    pattern = re.compile(
+        r"Execution Mode:\s*(.*?)\s*Resolution:\s*(.*?)\s*Runtime:\s*([\d.]+)\s*ms",
+        re.DOTALL,
+    )
+    for mode, _resolution, runtime_text in pattern.findall(stdout):
+        mode_name = mode.strip()
+        try:
+            runtimes[mode_name] = float(runtime_text)
+        except ValueError:
+            continue
+
+    baseline = next(
+        (
+            runtime
+            for mode, runtime in runtimes.items()
+            if "Sequential" in mode
+        ),
+        None,
+    )
+    speedups = {"sequential": 1.0 if baseline else 0.0}
+    if baseline and baseline > 0:
+        for mode, runtime in runtimes.items():
+            if runtime > 0:
+                speedups[mode.lower()] = round(baseline / runtime, 2)
+    return {
+        "runtimes_ms": runtimes,
+        "baseline_time_ms": baseline,
+        "speedups": speedups,
+    }
 
 
 @app.post("/api/upload")
@@ -141,6 +178,8 @@ def run_pipeline(request: PipelineRequest):
     ]
     environment = os.environ.copy()
     environment["OMP_NUM_THREADS"] = str(request.threads)
+    environment["PIPELINE_GAUSSIAN_KERNEL"] = str(request.gaussian_kernel)
+    environment["PIPELINE_OMP_SCHEDULE"] = request.omp_schedule
 
     try:
         completed = subprocess.run(
@@ -176,6 +215,9 @@ def run_pipeline(request: PipelineRequest):
     if request.enable_cuda and cuda_output.exists():
         cuda_image_url = "/output/cuda_edge.jpg"
 
+    performance = calculate_speedups_from_stdout(completed.stdout)
+    normalized_speedups = performance["speedups"]
+
     return {
         "success": True,
         "input": f"/input/{input_path.name}",
@@ -193,6 +235,24 @@ def run_pipeline(request: PipelineRequest):
         "cuda_image_url": cuda_image_url,
         "outputs": outputs,
         "stdout": completed.stdout,
+        "baseline_time_ms": performance["baseline_time_ms"],
+        "runtimes_ms": performance["runtimes_ms"],
+        "speedups": normalized_speedups,
+        "speedup": {
+            "sequential": normalized_speedups.get("sequential", 1.0),
+            "openmp": next(
+                (
+                    value
+                    for mode, value in normalized_speedups.items()
+                    if "openmp" in mode
+                ),
+                1.0,
+            ),
+            "cuda": normalized_speedups.get(
+                next((mode for mode in normalized_speedups if "cuda" in mode), ""),
+                1.0 if cuda_image_url else None,
+            ),
+        },
     }
 
 
@@ -202,6 +262,7 @@ def benchmark_results():
         return JSONResponse(content={"results": []})
 
     results = []
+    baseline_by_resolution = {}
     try:
         with BENCHMARK_FILE.open("r", newline="", encoding="utf-8") as file:
             for row in csv.reader(file):
@@ -215,12 +276,22 @@ def benchmark_results():
                     continue
                 if not mode.strip():
                     continue
+                resolution_key = resolution.strip()
+                if "Sequential" in mode:
+                    baseline_by_resolution[resolution_key] = execution_ms
+                baseline = baseline_by_resolution.get(resolution_key)
+                speedup = (
+                    round(baseline / execution_ms, 2)
+                    if baseline and baseline > 0 and execution_ms > 0
+                    else 1.0 if "Sequential" in mode else None
+                )
                 results.append(
                     {
                         "mode": mode.strip(),
                         "resolution": resolution.strip(),
                         "execution_time_ms": execution_ms,
                         "throughput_mpps": throughput_mpps,
+                        "speedup": speedup,
                     }
                 )
     except OSError as exc:

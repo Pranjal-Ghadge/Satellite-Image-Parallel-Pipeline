@@ -4,19 +4,25 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Satellite Parallel Pipeline</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
+    <div class="ambient-grid"></div>
     <header class="app-header">
-        <div>
-            <p class="eyebrow">Satellite Image Processing</p>
-            <h1>High-Performance Parallel Pipeline for Real-Time Satellite Image Filtering</h1>
+        <div class="brand-lockup">
+            <div class="brand-mark">SI</div>
+            <div>
+                <p class="eyebrow">Satellite Image Processing</p>
+                <h1>High-Performance Parallel Pipeline for Real-Time Satellite Image Filtering</h1>
+            </div>
         </div>
-        <div class="status-pill"><span></span> System Ready</div>
+        <div class="status-pill"><span id="statusDot"></span><b id="systemStatus">System Ready</b></div>
     </header>
 
     <main>
-        <section class="control-panel">
+        <section class="control-panel glass-panel">
             <div class="upload-zone" id="uploadZone">
                 <input type="file" id="imageInput" accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff">
                 <div class="upload-icon">↑</div>
@@ -46,69 +52,95 @@
                     <span>Enable CUDA</span>
                     <input type="checkbox" id="cudaToggle">
                 </label>
+                <button id="advancedButton" type="button" class="secondary-button">Advanced Settings</button>
                 <button id="runButton" type="button">Run Benchmark</button>
             </div>
         </section>
 
+        <section class="execution-panel glass-panel" id="executionPanel" hidden>
+            <div class="execution-heading">
+                <div><span class="eyebrow">Live Execution</span><strong id="executionTitle">Pipeline idle</strong></div>
+                <span id="executionPercent">0%</span>
+            </div>
+            <div class="progress-track"><div class="progress-bar" id="progressBar"></div></div>
+            <div class="terminal" id="terminalOutput" aria-live="polite"></div>
+        </section>
+
         <section>
             <div class="section-heading">
-                <div>
-                    <p class="eyebrow">Image Results</p>
-                    <h2>Processing Comparison</h2>
-                </div>
+                <div><p class="eyebrow">Image Results</p><h2>Processing Comparison</h2></div>
+                <button id="resetZoomButton" type="button" class="secondary-button">Reset synchronized view</button>
             </div>
             <div class="image-grid">
-                <article class="image-card">
-                    <div class="card-header"><span>Input Image</span></div>
+                <article class="image-card glass-panel" data-view="input">
+                    <div class="card-header"><span>Input Image</span><div class="meta-badges" id="inputMeta"></div></div>
                     <div class="image-frame"><img id="inputImage" alt="Input image"><span class="placeholder">No image selected</span></div>
                     <a id="downloadInput" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card">
-                    <div class="card-header"><span>Sequential CPU Edge Map</span></div>
-                    <div class="image-frame"><img id="sequentialImage" alt="Sequential output"><span class="placeholder">Awaiting run</span></div>
+                <article class="image-card glass-panel" data-view="sequential">
+                    <div class="card-header"><span>Sequential CPU</span><div class="meta-badges" id="sequentialMeta"></div></div>
+                    <div class="image-frame"><img id="sequentialImage" alt="Sequential edge map"><span class="speedup-badge" id="sequentialSpeedup">1.00x Baseline</span><span class="placeholder">Awaiting run</span></div>
                     <a id="downloadSequential" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card">
-                    <div class="card-header"><span>OpenMP CPU Edge Map</span></div>
-                    <div class="image-frame"><img id="openmpImage" alt="OpenMP output"><span class="placeholder">Awaiting run</span></div>
+                <article class="image-card glass-panel" data-view="openmp">
+                    <div class="card-header"><span>OpenMP CPU</span><div class="meta-badges" id="openmpMeta"></div></div>
+                    <div class="image-frame"><img id="openmpImage" alt="OpenMP edge map"><span class="speedup-badge" id="openmpSpeedup">Awaiting run</span><span class="placeholder">Awaiting run</span></div>
                     <a id="downloadOpenmp" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card">
-                    <div class="card-header"><span>CUDA GPU Edge Map</span></div>
-                    <div class="image-frame"><img id="cuda-img" alt="CUDA output"><span class="placeholder" id="cudaPlaceholder">CUDA Disabled</span></div>
+                <article class="image-card glass-panel" data-view="cuda">
+                    <div class="card-header"><span>CUDA GPU</span><div class="meta-badges" id="cudaMeta"></div></div>
+                    <div class="image-frame"><img id="cuda-img" alt="CUDA edge map"><span class="speedup-badge" id="cudaSpeedup">CUDA Disabled</span><span class="placeholder" id="cudaPlaceholder">CUDA Disabled</span></div>
                     <a id="downloadCuda" class="download" hidden download>Download</a>
                 </article>
             </div>
         </section>
 
+        <section class="split-section glass-panel">
+            <div class="split-toolbar">
+                <div><p class="eyebrow">Before / After</p><h2>Interactive Comparison</h2></div>
+                <label>Processed view
+                    <select id="splitProcessed">
+                        <option value="openmpImage">OpenMP Edge Map</option>
+                        <option value="sequentialImage">Sequential Edge Map</option>
+                        <option value="cuda-img">CUDA Edge Map</option>
+                    </select>
+                </label>
+            </div>
+            <div class="split-viewer" id="splitViewer">
+                <img id="splitBefore" alt="Original image">
+                <div class="split-after-wrap" id="splitAfterWrap"><img id="splitAfter" alt="Processed edge map"></div>
+                <div class="split-divider" id="splitDivider"><span>↔</span></div>
+            </div>
+        </section>
+
         <section>
             <div class="section-heading">
-                <div>
-                    <p class="eyebrow">Performance</p>
-                    <h2>Benchmark Analytics</h2>
-                </div>
+                <div><p class="eyebrow">Performance</p><h2>Benchmark Analytics</h2></div>
             </div>
             <div class="metric-grid">
-                <article><span>Peak CPU Speedup</span><strong id="peakCpu">—</strong><small>against sequential</small></article>
-                <article><span>GPU Execution Time</span><strong id="gpuTime">—</strong><small>milliseconds</small></article>
-                <article><span>Total Throughput</span><strong id="totalThroughput">—</strong><small>megapixels/sec</small></article>
+                <article class="glass-panel"><span>Peak Speedup Achieved</span><strong id="peakCpu">—</strong><small>S<sub>p</sub> against sequential baseline</small></article>
+                <article class="glass-panel"><span>GPU Acceleration</span><strong id="gpuTime">—</strong><small>GPU throughput MP/s</small></article>
+                <article class="glass-panel"><span>Total Time Savings</span><strong id="totalSavings">—</strong><small>versus sequential baseline</small></article>
             </div>
             <div class="chart-grid">
-                <article class="chart-card">
-                    <h3>Execution Time</h3>
-                    <canvas id="timeChart" aria-label="Execution time chart"></canvas>
-                </article>
-                <article class="chart-card">
-                    <h3>Throughput</h3>
-                    <canvas id="throughputChart" aria-label="Throughput chart"></canvas>
-                </article>
-                <article class="chart-card">
-                    <h3>Speedup</h3>
-                    <canvas id="speedupChart" aria-label="Speedup chart"></canvas>
-                </article>
+                <article class="chart-card glass-panel"><h3>Execution Latency</h3><canvas id="timeChart"></canvas></article>
+                <article class="chart-card glass-panel"><h3>Throughput Scaling</h3><canvas id="throughputChart"></canvas></article>
             </div>
         </section>
     </main>
+
+    <aside class="advanced-drawer" id="advancedDrawer" aria-hidden="true">
+        <div class="drawer-header"><div><p class="eyebrow">Pipeline Controls</p><h2>Advanced Settings</h2></div><button id="closeAdvanced" type="button">×</button></div>
+        <label>Gaussian kernel<select id="kernelSize"><option value="3">3 × 3</option><option value="5" selected>5 × 5</option><option value="7">7 × 7</option></select></label>
+        <label>OMP scheduling policy<select id="ompSchedule"><option value="static">static</option><option value="dynamic" selected>dynamic</option></select></label>
+        <div class="drawer-note">Settings are sent with the benchmark request and shown in the execution log.</div>
+    </aside>
+    <div class="drawer-backdrop" id="drawerBackdrop"></div>
+
+    <div class="modal" id="imageModal" aria-hidden="true">
+        <button id="closeModal" class="modal-close" type="button" aria-label="Close preview">×</button>
+        <img id="modalImage" alt="Full-screen image preview">
+    </div>
     <div id="toast" role="status"></div>
     <script src="/app.js"></script>
 </body>
