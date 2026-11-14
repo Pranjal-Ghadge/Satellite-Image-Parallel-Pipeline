@@ -1,5 +1,7 @@
 const state = {
-    uploadedFilename: null,
+    selectedFiles: { pre_image: null, post_image: null, ground_truth: null },
+    uploadedFiles: { pre_image: null, post_image: null, ground_truth: null },
+    filesChanged: true,
     zoom: 1,
     offsetX: 0,
     offsetY: 0,
@@ -8,27 +10,12 @@ const state = {
     dragY: 0,
 };
 
-document.querySelectorAll("img").forEach(image => {
-    image.addEventListener("error", () => {
-        image.removeAttribute("src");
-        image.style.display = "none";
-        const frame = image.closest(".image-frame");
-        if (frame) {
-            const placeholder = frame.querySelector(".placeholder");
-            if (placeholder) placeholder.style.display = "";
-        }
-    });
-});
-
 const charts = {};
-const elements = {
-    uploadZone: document.querySelector("#uploadZone"),
-    imageInput: document.querySelector("#imageInput"),
-    runButton: document.querySelector("#runButton"),
-    resolution: document.querySelector("#resolution"),
-    threads: document.querySelector("#threads"),
-    cuda: document.querySelector("#cudaToggle"),
-};
+const uploadFields = [
+    { key: "pre_image", input: "#preImageInput", label: "#preFileName", name: "Pre-Flood Satellite Image" },
+    { key: "post_image", input: "#postImageInput", label: "#postFileName", name: "Post-Flood Satellite Image" },
+    { key: "ground_truth", input: "#groundTruthInput", label: "#groundTruthFileName", name: "Ground-Truth Mask" },
+];
 
 function showToast(message) {
     const toast = document.querySelector("#toast");
@@ -56,106 +43,108 @@ function setProgress(percent, title) {
     document.querySelector("#executionTitle").textContent = title;
 }
 
-function setSpeedupBadge(id, speedup, unavailableText = "Awaiting run") {
-    const badge = document.querySelector(id);
-    if (!badge) return;
-    if (speedup === null || speedup === undefined) {
-        badge.textContent = unavailableText;
-        return;
-    }
-    badge.textContent = `${Number(speedup).toFixed(2)}x Speedup`;
-}
-
-async function updateMetadata(elementId, metaId, url) {
-    const image = document.querySelector(elementId);
-    const meta = document.querySelector(metaId);
-    if (!url) {
-        meta.innerHTML = "";
-        return;
-    }
-
-    await new Promise(resolve => {
-        if (image.complete) resolve();
-        else image.onload = resolve;
-    });
-
-    let size = "Size —";
-    try {
-        const response = await fetch(url, { method: "HEAD" });
-        const bytes = Number(response.headers.get("content-length"));
-        if (Number.isFinite(bytes) && bytes > 0) size = bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
-    } catch (_) {}
-
-    meta.innerHTML = `<span>${image.naturalWidth || 0} × ${image.naturalHeight || 0}</span><span>${size}</span><span>Grayscale</span>`;
-}
-
-function setImage(elementId, downloadId, metaId, url, filename) {
-    const image = document.querySelector(elementId);
-    const download = document.querySelector(downloadId);
-    const card = image.closest(".image-card") || image.parentElement.parentElement;
-    const placeholder = card?.querySelector(".placeholder");
-
-    if (url) {
-        image.src = url;
-    } else {
+function setImage(imageSelector, downloadSelector, metaSelector, url, filename) {
+    const image = document.querySelector(imageSelector);
+    const download = document.querySelector(downloadSelector);
+    const meta = document.querySelector(metaSelector);
+    const frame = image.closest(".image-frame");
+    const placeholder = frame?.querySelector(".placeholder");
+    image.onload = () => {
+        if (meta) {
+            meta.textContent = "";
+            const dimensions = document.createElement("span");
+            dimensions.textContent = `${image.naturalWidth} × ${image.naturalHeight}`;
+            meta.append(dimensions);
+        }
+    };
+    image.onerror = () => {
         image.removeAttribute("src");
+        image.style.display = "none";
+        if (placeholder) placeholder.style.display = "";
+        if (meta) meta.textContent = "";
+    };
+
+    if (!url) {
+        image.removeAttribute("src");
+        image.style.display = "none";
+        if (placeholder) placeholder.style.display = "";
+        if (download) download.hidden = true;
+        if (meta) meta.textContent = "";
+        return;
     }
-    image.style.display = url ? "block" : "none";
-    if (placeholder) placeholder.style.display = url ? "none" : "";
-    if (url) {
+
+    image.src = url;
+    image.style.display = "block";
+    if (placeholder) placeholder.style.display = "none";
+    if (download) {
         download.hidden = false;
         download.href = url;
         download.download = filename;
-        updateMetadata(elementId, metaId, url);
-    } else {
-        download.hidden = true;
     }
 }
 
-async function uploadFile(file) {
-    if (!file) return;
+function updateSelectedFile(field) {
+    const input = document.querySelector(field.input);
+    const file = input.files[0] || null;
+    state.selectedFiles[field.key] = file;
+    state.uploadedFiles[field.key] = null;
+    state.filesChanged = true;
+    document.querySelector(field.label).textContent = file ? file.name : field.name;
+}
+
+for (const field of uploadFields) {
+    document.querySelector(field.input).addEventListener("change", () => updateSelectedFile(field));
+}
+
+async function uploadSelection() {
+    if (!state.selectedFiles.pre_image || !state.selectedFiles.post_image) {
+        throw new Error("Choose both a pre-flood and post-flood image.");
+    }
+
     const body = new FormData();
-    body.append("file", file);
-    appendTerminal("Validating and uploading image...");
+    body.append("pre_image", state.selectedFiles.pre_image);
+    body.append("post_image", state.selectedFiles.post_image);
+    if (state.selectedFiles.ground_truth) {
+        body.append("ground_truth", state.selectedFiles.ground_truth);
+    }
+
+    const response = await fetch("/api/upload", { method: "POST", body });
+    const data = await response.json();
+    if (!response.ok) throw new Error(getApiError(data, "Upload failed"));
+    state.uploadedFiles = {
+        pre_image: data.files.pre_image.filename,
+        post_image: data.files.post_image.filename,
+        ground_truth: data.files.ground_truth?.filename || null,
+    };
+    state.filesChanged = false;
+
+    setImage("#preImage", "#downloadPre", "#preMeta", data.files.pre_image.url, "pre_flood_image");
+    setImage("#postImage", "#downloadPost", "#postMeta", data.files.post_image.url, "post_flood_image");
+    appendTerminal("Pre/post images uploaded and validated.", "[OK]");
+    if (data.files.ground_truth) appendTerminal("Ground-truth mask uploaded.", "[OK]");
+    return data;
+}
+
+document.querySelector("#uploadButton").addEventListener("click", async () => {
+    const button = document.querySelector("#uploadButton");
+    button.disabled = true;
     try {
-        const response = await fetch("/api/upload", { method: "POST", body });
-        const data = await response.json();
-        if (!response.ok) throw new Error(getApiError(data, "Upload failed"));
-        state.uploadedFilename = data.filename;
-        setImage("#inputImage", "#downloadInput", "#inputMeta", `${data.url}?t=${Date.now()}`, data.filename);
-        appendTerminal(`Upload complete: ${data.filename} (${(data.size_bytes / 1024).toFixed(1)} KB)`, "[OK]");
-        showToast("Image uploaded successfully");
+        appendTerminal("Uploading the image pair and optional reference mask...");
+        const uploaded = await uploadSelection();
+        if (uploaded.files.ground_truth) {
+            document.querySelector("#groundTruthFileName").textContent = "Reference mask uploaded";
+        }
+        showToast("Image pair uploaded successfully");
     } catch (error) {
         appendTerminal(error.message, "[ERR]");
         showToast(error.message);
+    } finally {
+        button.disabled = false;
     }
-}
+});
 
-elements.uploadZone.addEventListener("click", () => elements.imageInput.click());
-elements.imageInput.addEventListener("change", () => uploadFile(elements.imageInput.files[0]));
-["dragenter", "dragover"].forEach(type => elements.uploadZone.addEventListener(type, event => {
-    event.preventDefault();
-    elements.uploadZone.classList.add("dragging");
-}));
-["dragleave", "drop"].forEach(type => elements.uploadZone.addEventListener(type, event => {
-    event.preventDefault();
-    elements.uploadZone.classList.remove("dragging");
-}));
-elements.uploadZone.addEventListener("drop", event => uploadFile(event.dataTransfer.files[0]));
-
-elements.cuda.addEventListener("change", () => {
-    const cudaPlaceholder = document.querySelector("#cudaPlaceholder");
-    if (!elements.cuda.checked) {
-        document.querySelector("#cuda-img").removeAttribute("src");
-        document.querySelector("#cuda-img").style.display = "none";
-        cudaPlaceholder.style.display = "";
-        cudaPlaceholder.textContent = "CUDA Disabled";
-        document.querySelector("#cudaSpeedup").textContent = "CUDA Disabled";
-        document.querySelector("#downloadCuda").hidden = true;
-        document.querySelector("#cudaMeta").innerHTML = "";
-    } else {
-        cudaPlaceholder.textContent = "Awaiting CUDA Run";
-    }
+document.querySelector("#autoThreshold").addEventListener("change", event => {
+    document.querySelector("#threshold").disabled = event.target.checked;
 });
 
 function applySyncedTransform() {
@@ -174,7 +163,6 @@ document.querySelectorAll(".image-frame").forEach(frame => {
         }
         applySyncedTransform();
     }, { passive: false });
-
     frame.addEventListener("pointerdown", event => {
         if (state.zoom === 1) return;
         state.dragging = true;
@@ -189,7 +177,7 @@ document.querySelectorAll(".image-frame").forEach(frame => {
         applySyncedTransform();
     });
     frame.addEventListener("pointerup", () => { state.dragging = false; });
-    frame.addEventListener("click", event => {
+    frame.addEventListener("click", () => {
         const image = frame.querySelector("img");
         if (!image.src) return;
         document.querySelector("#modalImage").src = image.src;
@@ -212,252 +200,185 @@ document.querySelector("#imageModal").addEventListener("click", event => {
     if (event.target.id === "imageModal") document.querySelector("#closeModal").click();
 });
 
-function updateSplit() {
-    const viewer = document.querySelector("#splitViewer");
-    const after = document.querySelector("#splitAfter");
-    const selected = document.querySelector("#splitProcessed").value;
-    const selectedImage = document.querySelector(`#${selected}`);
-    const splitBefore = document.querySelector("#splitBefore");
-    const beforeSrc = document.querySelector("#inputImage").src || "";
-    let hasComparisonImage = false;
-    if (document.querySelector("#inputImage").hasAttribute("src") && beforeSrc) {
-        splitBefore.src = beforeSrc;
-        splitBefore.style.display = "block";
-        hasComparisonImage = true;
-    } else {
-        splitBefore.removeAttribute("src");
-        splitBefore.style.display = "none";
-    }
-    if (selectedImage?.hasAttribute("src") && selectedImage.src) {
-        after.src = selectedImage.src;
-        after.style.display = "block";
-    } else {
-        after.removeAttribute("src");
-        after.style.display = "none";
-    }
-    viewer.classList.toggle("has-image", hasComparisonImage);
-    after.style.width = `${viewer.clientWidth}px`;
+function renderMetrics(report) {
+    const areas = report.areas;
+    const benchmark = report.benchmark;
+    const runs = benchmark.openmp_runs || [];
+    document.querySelector("#floodArea").textContent = `${Number(areas.newly_inundated_flood_km2).toFixed(4)} km²`;
+    document.querySelector("#floodAreaHa").textContent = `${Number(areas.newly_inundated_flood_hectares).toFixed(2)} hectares`;
+    document.querySelector("#waterBreakdown").textContent =
+        `${Number(areas.permanent_water_km2).toFixed(3)} / ${Number(areas.newly_inundated_flood_km2).toFixed(3)} km²`;
+    document.querySelector("#waterBreakdownDetail").textContent =
+        `Permanent / newly flooded · post-flood total ${Number(areas.post_flood_total_water_km2).toFixed(3)} km²`;
+
+    const sequential = Number(benchmark.sequential_runtime_ms);
+    const fastest = runs.reduce((best, run) => !best || run.runtime_ms < best.runtime_ms ? run : best, null);
+    document.querySelector("#sequentialTime").textContent = `${sequential.toFixed(2)} ms`;
+    document.querySelector("#parallelTime").textContent = fastest ? `${Number(fastest.runtime_ms).toFixed(2)} ms` : "—";
+    document.querySelector("#parallelSummary").textContent = fastest
+        ? `Fastest OpenMP run · ${fastest.threads} threads`
+        : "No OpenMP benchmark runs";
+    const peak = runs.reduce((best, run) => !best || run.speedup > best.speedup ? run : best, null);
+    document.querySelector("#peakSpeedup").textContent = peak ? `${Number(peak.speedup).toFixed(2)}×` : "—";
+    document.querySelector("#parallelEfficiency").textContent = peak
+        ? `${Number(peak.parallel_efficiency_percent).toFixed(1)}% efficiency · ${peak.threads} threads`
+        : "Peak speedup / efficiency";
+
+    const verified = runs.length > 0 && runs.every(run => run.verification_passed);
+    const mismatches = runs.reduce((total, run) =>
+        total + Number(run.mismatched_pixels || 0) + Number(run.semantic_mismatched_pixels || 0), 0);
+    const verification = document.querySelector("#verificationStatus");
+    verification.textContent = verified ? "PASSED / 0 mismatched pixels" : `FAILED / ${mismatches} mismatched pixels`;
+    verification.classList.toggle("passed", verified);
+    verification.classList.toggle("failed", !verified);
+    document.querySelector("#verificationDetail").textContent =
+        verified ? "Flood and semantic maps match across all OpenMP runs" : "Flood and semantic map equivalence check";
+
+    renderCharts(runs, sequential);
 }
 
-function setSplitPosition(clientX) {
-    const viewer = document.querySelector("#splitViewer");
-    const rect = viewer.getBoundingClientRect();
-    const position = Math.min(100, Math.max(0, ((clientX - rect.left) / rect.width) * 100));
-    document.querySelector("#splitAfterWrap").style.right = `${100 - position}%`;
-    document.querySelector("#splitDivider").style.left = `${position}%`;
-}
-
-document.querySelector("#splitViewer").addEventListener("pointerdown", event => {
-    event.currentTarget.setPointerCapture(event.pointerId);
-    setSplitPosition(event.clientX);
-});
-document.querySelector("#splitViewer").addEventListener("pointermove", event => {
-    if (event.buttons === 1) setSplitPosition(event.clientX);
-});
-document.querySelector("#splitProcessed").addEventListener("change", updateSplit);
-
-const drawer = document.querySelector("#advancedDrawer");
-const backdrop = document.querySelector("#drawerBackdrop");
-function toggleDrawer(open) {
-    drawer.classList.toggle("open", open);
-    backdrop.classList.toggle("open", open);
-    drawer.setAttribute("aria-hidden", String(!open));
-}
-document.querySelector("#advancedButton").addEventListener("click", () => toggleDrawer(true));
-document.querySelector("#closeAdvanced").addEventListener("click", () => toggleDrawer(false));
-backdrop.addEventListener("click", () => toggleDrawer(false));
-
-elements.runButton.addEventListener("click", async () => {
-    if (!state.uploadedFilename) {
-        showToast("Upload an image before running the pipeline.");
+function renderCharts(runs, sequential) {
+    if (!window.Chart) {
+        showToast("Chart.js is unavailable; flood maps and metrics are still ready.");
         return;
     }
+    const labels = runs.map(run => `${run.threads} thread${run.threads === 1 ? "" : "s"}`);
+    const times = runs.map(run => Number(run.runtime_ms));
+    const speedups = runs.map(run => Number(run.speedup));
+    const efficiencies = runs.map(run => Number(run.parallel_efficiency_percent));
+    Chart.defaults.color = "#94a3b8";
+    Chart.defaults.borderColor = "rgba(148,163,184,.12)";
+    Chart.defaults.font.family = "Inter, Segoe UI, sans-serif";
 
-    elements.runButton.disabled = true;
-    elements.runButton.textContent = "Processing...";
+    const specifications = [
+        ["time", "timeChart", "bar", "Runtime (ms)", times, "#22d3ee"],
+        ["speedup", "speedupChart", "line", "Speedup (×)", speedups, "#a78bfa"],
+        ["efficiency", "efficiencyChart", "line", "Efficiency (%)", efficiencies, "#34d399"],
+    ];
+    for (const [key, canvasId, type, label, values, color] of specifications) {
+        const canvas = document.querySelector(`#${canvasId}`);
+        const options = {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: { legend: { display: false } },
+            scales: { y: { beginAtZero: true }, x: { grid: { display: false } } },
+        };
+        const data = {
+            labels,
+            datasets: [{
+                label,
+                data: values,
+                borderColor: color,
+                backgroundColor: type === "bar" ? `${color}cc` : `${color}22`,
+                fill: type === "line",
+                tension: 0.3,
+                pointRadius: 4,
+                borderRadius: type === "bar" ? 6 : 0,
+            }],
+        };
+        if (charts[key]) {
+            charts[key].data = data;
+            charts[key].options = options;
+            charts[key].update();
+        } else {
+            charts[key] = new Chart(canvas, { type, data, options });
+        }
+    }
+    document.querySelector("#timeChart").dataset.baselineMs = String(sequential);
+}
+
+function displayOutputs(outputs) {
+    setImage("#preImage", "#downloadPre", "#preMeta", outputs.pre_imagery, "pre_flood_image");
+    setImage("#postImage", "#downloadPost", "#postMeta", outputs.post_imagery, "post_flood_image");
+    setImage("#permanentMask", "#downloadPermanent", "#permanentMeta", outputs.permanent_water_mask, "permanent_water_mask.png");
+    setImage("#floodMask", "#downloadFlood", "#floodMeta", outputs.flood_mask, "flood_mask.png");
+    setImage("#floodOverlay", "#downloadOverlay", "#overlayMeta", outputs.flood_overlay, "flood_overlay.png");
+}
+
+document.querySelector("#runButton").addEventListener("click", async () => {
+    const runButton = document.querySelector("#runButton");
+    runButton.disabled = true;
     document.querySelector("#systemStatus").textContent = "Processing";
     document.querySelector(".status-pill").classList.add("processing");
     document.querySelector("#terminalOutput").textContent = "";
-    setProgress(10, "Preparing pipeline");
-    appendTerminal("[1/3] Upload prepared image", "[RUN]");
-
-    await new Promise(resolve => setTimeout(resolve, 180));
-    setProgress(38, "Running CPU kernels");
-    appendTerminal("[2/3] Running sequential/OpenMP kernels");
-    if (elements.cuda.checked) appendTerminal("CUDA pass enabled; waiting for GPU executable output");
-    appendTerminal(`Kernel ${document.querySelector("#kernelSize").value}×${document.querySelector("#kernelSize").value} filter; scheduling=${document.querySelector("#ompSchedule").value}`);
-
     try {
+        if (state.filesChanged || !state.uploadedFiles.pre_image || !state.uploadedFiles.post_image) {
+            setProgress(10, "Uploading satellite image pair");
+            await uploadSelection();
+        }
+
+        const autoThreshold = document.querySelector("#autoThreshold").checked;
+        const pixelText = document.querySelector("#pixelSize").value.trim();
+        const thresholdText = document.querySelector("#threshold").value.trim();
+        const payload = {
+            pre_filename: state.uploadedFiles.pre_image,
+            post_filename: state.uploadedFiles.post_image,
+            ground_truth_filename: state.uploadedFiles.ground_truth,
+            pixel_size: pixelText ? Number(pixelText) : null,
+            auto_threshold: autoThreshold,
+            threshold: autoThreshold ? null : Number(thresholdText),
+        };
+        if (pixelText && (!Number.isFinite(payload.pixel_size) || payload.pixel_size <= 0)) {
+            throw new Error("Pixel size must be a positive number.");
+        }
+        if (!autoThreshold && (!Number.isFinite(payload.threshold) || payload.threshold < 0 || payload.threshold > 1)) {
+            throw new Error("Threshold must be between 0 and 1.");
+        }
+
+        setProgress(25, "Running sequential and OpenMP pipelines");
+        appendTerminal("Running complete flood pipeline with 1, 2, 4, 8, and 16 OpenMP threads.", "[RUN]");
+        appendTerminal(autoThreshold ? "Using independent Otsu thresholds." : `Using water threshold ${payload.threshold}.`);
         const response = await fetch("/api/run-pipeline", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-                input_filename: state.uploadedFilename,
-                resolution: elements.resolution.value,
-                threads: Number(elements.threads.value),
-                enable_cuda: elements.cuda.checked,
-                gaussian_kernel: Number(document.querySelector("#kernelSize").value),
-                omp_schedule: document.querySelector("#ompSchedule").value,
-            }),
+            body: JSON.stringify(payload),
         });
         const data = await response.json();
-        if (!response.ok) throw new Error(getApiError(data, "Pipeline failed"));
+        if (!response.ok) throw new Error(getApiError(data, "Flood analysis failed"));
 
-        setProgress(78, "Parsing benchmark results");
-        appendTerminal("[3/3] Loading output maps and parsing benchmark CSV");
-        setImage("#inputImage", "#downloadInput", "#inputMeta", data.prepared_input, "input_prepared.jpg");
-        setImage("#sequentialImage", "#downloadSequential", "#sequentialMeta", data.outputs.sequential, "sequential_edge.jpg");
-        setImage("#openmpImage", "#downloadOpenmp", "#openmpMeta", data.outputs.openmp, "openmp_edge.jpg");
-        document.querySelector("#sequentialSpeedup").textContent = "1.00x (Baseline)";
-        setSpeedupBadge("#openmpSpeedup", data.speedup?.openmp);
-
-        const cudaImage = document.querySelector("#cuda-img");
-        const cudaPlaceholder = document.querySelector("#cudaPlaceholder");
-        if (data.cuda_image_url) {
-            cudaPlaceholder.style.display = "none";
-            cudaImage.style.display = "block";
-            cudaImage.src = `${data.cuda_image_url}?t=${Date.now()}`;
-            document.querySelector("#downloadCuda").hidden = false;
-            document.querySelector("#downloadCuda").href = data.cuda_image_url;
-            updateMetadata("#cuda-img", "#cudaMeta", data.cuda_image_url);
-            setSpeedupBadge("#cudaSpeedup", data.speedup?.cuda, "CUDA Unavailable");
-            appendTerminal("CUDA edge map generated", "[OK]");
-        } else if (data.cuda_requested) {
-            cudaImage.removeAttribute("src");
-            cudaImage.style.display = "none";
-            cudaPlaceholder.style.display = "";
-            cudaPlaceholder.textContent = data.cuda_status === "unavailable_build" ? "CUDA Not Built" : "CUDA Unavailable";
-            document.querySelector("#cudaMeta").innerHTML = "";
-            document.querySelector("#cudaSpeedup").textContent = "CUDA Unavailable";
-            appendTerminal("CUDA requested, but the current executable is CPU-only", "[WARN]");
-        } else {
-            cudaImage.removeAttribute("src");
-            cudaImage.style.display = "none";
-            cudaPlaceholder.style.display = "";
-            cudaPlaceholder.textContent = "CUDA Disabled";
-            document.querySelector("#cudaSpeedup").textContent = "CUDA Disabled";
-            appendTerminal("CUDA pass skipped", "[INFO]");
+        setProgress(78, "Loading flood maps and reports");
+        displayOutputs(data.outputs);
+        renderMetrics(data.flood_report);
+        appendTerminal("Flood report, benchmark CSV, and output maps loaded.", "[OK]");
+        appendTerminal(`Sequential runtime: ${Number(data.benchmark.sequential_runtime_ms).toFixed(2)} ms.`);
+        const checked = (data.benchmark.openmp_runs || []).filter(run => run.verification_passed);
+        appendTerminal(`Sequential/OpenMP verification: ${checked.length}/${data.benchmark.openmp_runs.length} runs passed.`, checked.length === data.benchmark.openmp_runs.length ? "[OK]" : "[WARN]");
+        const accuracy = data.flood_report.accuracy_metrics;
+        if (accuracy?.evaluated) {
+            appendTerminal(`Ground-truth F1 ${Number(accuracy.f1_score_dice_coefficient).toFixed(4)} · IoU ${Number(accuracy.intersection_over_union_critical_success_index).toFixed(4)}.`);
         }
-
-        updateSplit();
-        await loadBenchmarks();
-        setProgress(100, "Benchmark complete");
-        appendTerminal("Pipeline and benchmark completed successfully", "[OK]");
-        showToast(data.cuda_image_url ? "Pipeline and CUDA execution completed" : "Pipeline completed");
+        setProgress(100, "Flood analysis complete");
+        showToast("Flood inundation mapping complete");
     } catch (error) {
         appendTerminal(error.message, "[ERR]");
         showToast(error.message);
         setProgress(100, "Execution failed");
     } finally {
-        elements.runButton.disabled = false;
-        elements.runButton.textContent = "Run Benchmark";
+        runButton.disabled = false;
         document.querySelector("#systemStatus").textContent = "System Ready";
         document.querySelector(".status-pill").classList.remove("processing");
     }
 });
 
-function chartDefaults() {
-    Chart.defaults.color = "#94a3b8";
-    Chart.defaults.borderColor = "rgba(148,163,184,.12)";
-    Chart.defaults.font.family = "Inter, Segoe UI, sans-serif";
-}
-
-const speedupDataLabelPlugin = {
-    id: "speedupDataLabels",
-    afterDatasetsDraw(chart) {
-        const { ctx } = chart;
-        ctx.save();
-        ctx.font = "700 11px Inter, Segoe UI, sans-serif";
-        ctx.textAlign = "center";
-        ctx.fillStyle = "#ecfeff";
-        chart.data.datasets.forEach((dataset, datasetIndex) => {
-            const meta = chart.getDatasetMeta(datasetIndex);
-            meta.data.forEach((element, index) => {
-                const speedup = chart.data.speedups?.[index];
-                if (!speedup) return;
-                const position = element.tooltipPosition();
-                ctx.fillText(`Sp ${Number(speedup).toFixed(2)}x`, position.x, position.y - 9);
-            });
-        });
-        ctx.restore();
-    },
-};
-
-async function loadBenchmarks() {
-    if (!window.Chart) return;
-    chartDefaults();
+async function loadPreviousBenchmarks() {
     try {
         const response = await fetch("/api/benchmark-results");
         const data = await response.json();
-        const results = data.results || [];
-        if (!results.length) return;
-
-        const latestResolution = results[results.length - 1]?.resolution;
-        const latest = results.filter(row => row.resolution === latestResolution);
-        const cpuResults = latest.filter(row => !row.mode.includes("CUDA"));
-        const labels = cpuResults.map(row => row.mode.replace("CPU ", "").replace("Baseline", "Sequential"));
-        const times = cpuResults.map(row => row.execution_time_ms);
-        const throughput = cpuResults.map(row => row.throughput_mpps);
-        const gpu = latest.find(row => row.mode.includes("CUDA"));
-        const sequential = latest.find(row => row.mode.includes("Sequential"))?.execution_time_ms || times[0] || 0;
-        const fastestCpu = Math.min(...times);
-        const peakSpeed = sequential > 0 ? sequential / fastestCpu : 0;
-        const allSpeedups = latest
-            .map(row => typeof row.speedup === "number" ? row.speedup : null)
-            .filter(value => value !== null);
-        const peakAchieved = Math.max(1, peakSpeed, ...allSpeedups);
-        const savings = sequential > 0 && fastestCpu > 0 ? ((sequential - fastestCpu) / sequential) * 100 : 0;
-        const speedups = cpuResults.map(row =>
-            typeof row.speedup === "number"
-                ? row.speedup
-                : (sequential && row.execution_time_ms > 0 ? Math.round((sequential / row.execution_time_ms) * 100) / 100 : 1)
-        );
-
-        document.querySelector("#peakCpu").textContent = `${peakAchieved.toFixed(2)}x`;
-        document.querySelector("#gpuTime").textContent = gpu ? `${gpu.throughput_mpps.toFixed(1)} MP/s` : "—";
-        document.querySelector("#totalSavings").textContent = `${Math.max(0, savings).toFixed(1)}%`;
-        document.querySelector("#sequentialSpeedup").textContent = "1.00x (Baseline)";
-        const openmpLatest = [...cpuResults].reverse().find(row => row.mode.includes("OpenMP"));
-        if (openmpLatest?.speedup) {
-            setSpeedupBadge("#openmpSpeedup", openmpLatest.speedup);
-        }
-
-        if (!charts.time) {
-            charts.time = new Chart(document.querySelector("#timeChart"), {
-                type: "bar",
-                data: { labels, speedups, datasets: [{ label: "Execution Time (ms)", data: times, backgroundColor: ["rgba(34,211,238,.85)", "rgba(96,165,250,.85)", "rgba(129,140,248,.85)", "rgba(167,139,250,.85)", "rgba(52,211,153,.85)"], borderRadius: 7, borderSkipped: false }] },
-                plugins: [speedupDataLabelPlugin],
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: context => `${context.formattedValue} ms · Sp ${Number(speedups[context.dataIndex] || 1).toFixed(2)}x` } } }, scales: { y: { beginAtZero: true, title: { display: true, text: "milliseconds" } }, x: { grid: { display: false } } } }
-            });
-        } else {
-            charts.time.data.labels = labels;
-            charts.time.data.speedups = speedups;
-            charts.time.data.datasets[0].data = times;
-            charts.time.update();
-        }
-
-        const threadLabels = cpuResults.map(row => {
-            const match = row.mode.match(/(\d+)\s+Threads?/);
-            return match ? `${match[1]}T` : "1T";
-        });
-        if (!charts.throughput) {
-            charts.throughput = new Chart(document.querySelector("#throughputChart"), {
-                type: "line",
-                data: { labels: threadLabels, speedups, datasets: [{ label: "CPU Throughput (MP/s)", data: throughput, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,.12)", fill: true, tension: .35, pointRadius: 5, pointBackgroundColor: "#22d3ee" }, ...(gpu ? [{ label: "CUDA GPU", data: threadLabels.map((_, index) => index === threadLabels.length - 1 ? gpu.throughput_mpps : null), borderColor: "#a78bfa", backgroundColor: "rgba(167,139,250,.12)", pointBackgroundColor: "#a78bfa", spanGaps: false }] : [])] },
-                plugins: [speedupDataLabelPlugin],
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 10 } } }, scales: { y: { beginAtZero: true, title: { display: true, text: "Megapixels/sec" } }, x: { title: { display: true, text: "Thread configuration" }, grid: { display: false } } } }
-            });
-        } else {
-            charts.throughput.data.labels = threadLabels;
-            charts.throughput.data.speedups = speedups;
-            charts.throughput.data.datasets[0].data = throughput;
-            if (charts.throughput.data.datasets[1]) charts.throughput.data.datasets[1].data = threadLabels.map((_, index) => index === threadLabels.length - 1 && gpu ? gpu.throughput_mpps : null);
-            charts.throughput.update();
-        }
+        const runs = data.latest_benchmark?.openmp_runs || [];
+        const sequential = Number(data.latest_benchmark?.sequential_runtime_ms);
+        if (runs.length) renderCharts(runs, sequential);
     } catch (_) {
-        showToast("Unable to load benchmark analytics.");
+        showToast("Unable to load previous benchmark analytics.");
     }
 }
 
-window.addEventListener("resize", () => updateSplit());
-loadBenchmarks();
+document.querySelectorAll("img").forEach(image => {
+    image.addEventListener("error", () => {
+        image.removeAttribute("src");
+        image.style.display = "none";
+        const placeholder = image.closest(".image-frame")?.querySelector(".placeholder");
+        if (placeholder) placeholder.style.display = "";
+    });
+});
+
+loadPreviousBenchmarks();

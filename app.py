@@ -1,8 +1,9 @@
 import csv
+import json
 import os
 import subprocess
+import threading
 import uuid
-import re
 from pathlib import Path
 from typing import Optional
 
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from PIL import Image, ImageOps
+from PIL import Image
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -20,7 +21,8 @@ DATA_OUTPUT_DIR = PROJECT_DIR / "data" / "output"
 FRONTEND_DIR = PROJECT_DIR / "frontend"
 BENCHMARK_FILE = PROJECT_DIR / "docs" / "benchmark_results.csv"
 PIPELINE_EXE = PROJECT_DIR / "build-ninja" / "parallel_pipeline.exe"
-CMAKE_CACHE = PROJECT_DIR / "build-ninja" / "CMakeCache.txt"
+FLOOD_REPORT_FILE = DATA_OUTPUT_DIR / "flood_report.json"
+PIPELINE_LOCK = threading.Lock()
 
 DATA_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,90 +39,133 @@ app.add_middleware(
 
 
 class PipelineRequest(BaseModel):
-    input_filename: Optional[str] = None
-    resolution: str = Field(default="1024x1024", pattern=r"^(512x512|1024x1024|4096x4096)$")
-    threads: int = Field(default=8, ge=1, le=64)
-    enable_cuda: bool = False
-    gaussian_kernel: int = Field(default=5, ge=3, le=7)
-    omp_schedule: str = Field(default="dynamic", pattern=r"^(static|dynamic)$")
+    pre_filename: str = Field(min_length=1)
+    post_filename: str = Field(min_length=1)
+    pixel_size: Optional[float] = Field(default=None, gt=0)
+    threshold: Optional[float] = Field(default=None, ge=0, le=1)
+    auto_threshold: bool = False
+    ground_truth_filename: Optional[str] = None
 
 
-def cuda_build_is_enabled() -> bool:
-    if not CMAKE_CACHE.exists():
-        return False
+async def save_uploaded_image(upload: UploadFile) -> dict:
+    if not upload.filename:
+        raise HTTPException(status_code=400, detail="Every uploaded image must have a file name.")
 
-    enabled_values = set()
-    with CMAKE_CACHE.open("r", encoding="utf-8", errors="replace") as cache:
-        for line in cache:
-            line = line.strip()
-            if line.startswith("USE_CUDA:") or line.startswith("ENABLE_CUDA:"):
-                value = line.rsplit("=", 1)[-1].strip().upper()
-                enabled_values.add(value == "TRUE" or value == "ON" or value == "1" or value == "YES")
-
-    return bool(enabled_values) and any(enabled_values)
-
-
-def calculate_speedups_from_stdout(stdout: str) -> dict:
-    """Parse runtime blocks emitted by utils.cpp and calculate Sp values."""
-    runtimes = {}
-    pattern = re.compile(
-        r"Execution Mode:\s*(.*?)\s*Resolution:\s*(.*?)\s*Runtime:\s*([\d.]+)\s*ms",
-        re.DOTALL,
-    )
-    for mode, _resolution, runtime_text in pattern.findall(stdout):
-        mode_name = mode.strip()
-        try:
-            runtimes[mode_name] = float(runtime_text)
-        except ValueError:
-            continue
-
-    baseline = next(
-        (
-            runtime
-            for mode, runtime in runtimes.items()
-            if "Sequential" in mode
-        ),
-        None,
-    )
-    speedups = {"sequential": 1.0 if baseline else 0.0}
-    if baseline and baseline > 0:
-        for mode, runtime in runtimes.items():
-            if runtime > 0:
-                speedups[mode.lower()] = round(baseline / runtime, 2)
-    return {
-        "runtimes_ms": runtimes,
-        "baseline_time_ms": baseline,
-        "speedups": speedups,
-    }
-
-
-@app.post("/api/upload")
-async def upload_image(file: UploadFile = File(...)):
-    if not file.filename:
-        raise HTTPException(status_code=400, detail="A file name is required.")
-
-    extension = Path(file.filename).suffix.lower()
+    extension = Path(upload.filename).suffix.lower()
     if extension not in {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}:
-        raise HTTPException(status_code=400, detail="Unsupported image format.")
+        raise HTTPException(status_code=400, detail=f"Unsupported image format: {extension or 'none'}.")
 
+    saved_path = DATA_INPUT_DIR / f"{uuid.uuid4().hex}{extension}"
     try:
-        contents = await file.read()
-        upload_id = uuid.uuid4().hex
-        saved_path = DATA_INPUT_DIR / f"{upload_id}{extension}"
+        contents = await upload.read()
+        if not contents:
+            raise HTTPException(status_code=400, detail="Uploaded images cannot be empty.")
         saved_path.write_bytes(contents)
-
         with Image.open(saved_path) as image:
             image.verify()
+    except HTTPException:
+        saved_path.unlink(missing_ok=True)
+        raise
     except Exception as exc:
-        if "saved_path" in locals() and saved_path.exists():
-            saved_path.unlink()
-        raise HTTPException(status_code=400, detail="The uploaded file is not a valid image.") from exc
+        saved_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Invalid image: {upload.filename}") from exc
+    finally:
+        await upload.close()
 
     return {
         "filename": saved_path.name,
         "url": f"/input/{saved_path.name}",
         "size_bytes": saved_path.stat().st_size,
     }
+
+
+@app.post("/api/upload")
+async def upload_images(
+    pre_image: Optional[UploadFile] = File(default=None),
+    post_image: Optional[UploadFile] = File(default=None),
+    ground_truth: Optional[UploadFile] = File(default=None),
+):
+    if (pre_image is None) != (post_image is None):
+        raise HTTPException(status_code=400, detail="Upload both pre_image and post_image together.")
+    if pre_image is None and post_image is None:
+        raise HTTPException(status_code=400, detail="Upload a pre/post image pair.")
+
+    saved = {}
+    try:
+        if pre_image is not None and post_image is not None:
+            saved["pre_image"] = await save_uploaded_image(pre_image)
+            saved["post_image"] = await save_uploaded_image(post_image)
+        if ground_truth is not None:
+            saved["ground_truth"] = await save_uploaded_image(ground_truth)
+    except Exception:
+        for item in saved.values():
+            (DATA_INPUT_DIR / item["filename"]).unlink(missing_ok=True)
+        raise
+
+    return {"files": saved}
+
+
+def resolve_uploaded_path(filename: str, field_name: str) -> Path:
+    candidate_name = Path(filename).name
+    if candidate_name != filename:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name} filename.")
+    candidate = (DATA_INPUT_DIR / candidate_name).resolve()
+    if DATA_INPUT_DIR.resolve() not in candidate.parents or not candidate.is_file():
+        raise HTTPException(status_code=404, detail=f"Uploaded {field_name} image was not found.")
+    return candidate
+
+
+def read_benchmark_csv() -> list[dict]:
+    if not BENCHMARK_FILE.exists():
+        return []
+
+    results = []
+    try:
+        with BENCHMARK_FILE.open("r", newline="", encoding="utf-8") as file:
+            reader = csv.DictReader(file)
+            if reader.fieldnames and "runtime_ms" in reader.fieldnames:
+                for row in reader:
+                    try:
+                        results.append({
+                            "mode": row["mode"],
+                            "resolution": row["resolution"],
+                            "execution_time_ms": float(row["runtime_ms"]),
+                            "throughput_mpps": float(row["throughput_mps"]),
+                            "threads": int(row["threads"] or 0),
+                            "speedup": float(row["speedup"]),
+                            "parallel_efficiency_percent": float(
+                                row["parallel_efficiency_percent"]),
+                            "verification": row["verification"],
+                            "mismatched_flood_pixels": int(
+                                row["mismatched_flood_pixels"] or 0),
+                            "mismatched_semantic_pixels": int(
+                                row["mismatched_semantic_pixels"] or 0),
+                        })
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            else:
+                file.seek(0)
+                for row in csv.reader(file):
+                    if len(row) < 4:
+                        continue
+                    try:
+                        results.append({
+                            "mode": row[0],
+                            "resolution": row[1],
+                            "execution_time_ms": float(row[2]),
+                            "throughput_mpps": float(row[3]),
+                            "threads": 1 if "Sequential" in row[0] else 0,
+                            "speedup": None,
+                            "parallel_efficiency_percent": None,
+                            "verification": "N/A",
+                            "mismatched_flood_pixels": 0,
+                            "mismatched_semantic_pixels": 0,
+                        })
+                    except ValueError:
+                        continue
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to read benchmark results: {exc}") from exc
+    return results
 
 
 @app.post("/api/run-pipeline")
@@ -131,173 +176,101 @@ def run_pipeline(request: PipelineRequest):
             detail=f"Pipeline executable not found: {PIPELINE_EXE}",
         )
 
-    cuda_enabled_in_build = cuda_build_is_enabled()
-    cuda_requested_but_unavailable = request.enable_cuda and not cuda_enabled_in_build
-
-    if not request.input_filename:
-        raise HTTPException(status_code=400, detail="input_filename is required.")
-
-    input_path = (DATA_INPUT_DIR / Path(request.input_filename).name).resolve()
-    if DATA_INPUT_DIR.resolve() not in input_path.parents:
-        raise HTTPException(status_code=400, detail="Invalid input filename.")
-    if not input_path.exists():
-        raise HTTPException(status_code=404, detail="Uploaded input image was not found.")
-
-    width_height = request.resolution.lower().split("x")
-    if len(width_height) != 2:
-        raise HTTPException(status_code=400, detail="Invalid resolution.")
-
-    prepared_path = DATA_INPUT_DIR / f"prepared_{input_path.stem}_{width_height[0]}x{width_height[1]}{input_path.suffix.lower()}"
-    try:
-        with Image.open(input_path) as image:
-            grayscale = ImageOps.grayscale(image)
-            resized = ImageOps.fit(
-                grayscale,
-                (int(width_height[0]), int(width_height[1])),
-                method=Image.Resampling.LANCZOS,
-            )
-            if prepared_path.suffix.lower() in {".jpg", ".jpeg"}:
-                resized.save(prepared_path, format="JPEG")
-            else:
-                resized.save(prepared_path)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail="Unable to prepare the uploaded image.") from exc
-
-    for output_name in ("seq_edge.jpg", "omp_edge.jpg", "cuda_edge.jpg"):
-        output_path = DATA_OUTPUT_DIR / output_name
-        if output_path.exists():
-            output_path.unlink()
-
-    command = [
-        os.path.abspath(PIPELINE_EXE),
-        str(prepared_path),
-        "--threads",
-        str(request.threads),
-        "--resolution",
-        request.resolution,
-    ]
-    environment = os.environ.copy()
-    environment["OMP_NUM_THREADS"] = str(request.threads)
-    environment["PIPELINE_GAUSSIAN_KERNEL"] = str(request.gaussian_kernel)
-    environment["PIPELINE_OMP_SCHEDULE"] = request.omp_schedule
-
-    try:
-        completed = subprocess.run(
-            command,
-            cwd=str(PROJECT_DIR),
-            env=environment,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
+    if request.auto_threshold and request.threshold is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either threshold or auto_threshold, not both.",
         )
+
+    pre_path = resolve_uploaded_path(request.pre_filename, "pre-flood")
+    post_path = resolve_uploaded_path(request.post_filename, "post-flood")
+    ground_truth_path = None
+    if request.ground_truth_filename:
+        ground_truth_path = resolve_uploaded_path(
+            request.ground_truth_filename, "ground-truth")
+
+    command = [os.path.abspath(PIPELINE_EXE), "--pre", str(pre_path), "--post", str(post_path)]
+    if request.pixel_size is not None:
+        command.extend(["--pixel-size", str(request.pixel_size)])
+    if request.auto_threshold:
+        command.append("--auto-threshold")
+    elif request.threshold is not None:
+        command.extend(["--threshold", str(request.threshold)])
+    if ground_truth_path is not None:
+        command.extend(["--ground-truth", str(ground_truth_path)])
+    command.append("--benchmark")
+
+    try:
+        with PIPELINE_LOCK:
+            completed = subprocess.run(
+                command,
+                cwd=str(PROJECT_DIR),
+                env=os.environ.copy(),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip() or completed.stdout.strip() or "Pipeline execution failed."
+                raise HTTPException(status_code=500, detail=detail)
+            try:
+                with FLOOD_REPORT_FILE.open("r", encoding="utf-8") as report_file:
+                    flood_report = json.load(report_file)
+            except (OSError, json.JSONDecodeError) as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Unable to read generated flood report: {exc}",
+                ) from exc
+            benchmark_csv_rows = read_benchmark_csv()
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(status_code=504, detail="Pipeline execution timed out.") from exc
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Unable to start pipeline: {exc}") from exc
 
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "Pipeline execution failed."
-        raise HTTPException(status_code=500, detail=detail)
-
+    output_files = {
+        "pre_imagery": pre_path.name,
+        "post_imagery": post_path.name,
+        "permanent_water_mask": "pre_water_mask.png",
+        "post_water_mask": "post_water_mask.png",
+        "flood_mask": "flood_mask.png",
+        "flood_overlay": "flood_overlay.png",
+        "semantic_classification": "semantic_classification.png",
+    }
     outputs = {}
-    for key, filename in (
-        ("sequential", "seq_edge.jpg"),
-        ("openmp", "omp_edge.jpg"),
-        ("cuda", "cuda_edge.jpg"),
-    ):
-        output_path = DATA_OUTPUT_DIR / filename
-        if output_path.exists():
-            outputs[key] = f"/output/{filename}?v={uuid.uuid4().hex}"
+    for key, filename in output_files.items():
+        output_path = DATA_INPUT_DIR / filename if key.endswith("imagery") else DATA_OUTPUT_DIR / filename
+        if not output_path.is_file():
+            raise HTTPException(status_code=500, detail=f"Expected pipeline output is missing: {filename}")
+        directory = "input" if key.endswith("imagery") else "output"
+        outputs[key] = f"/{directory}/{filename}?v={uuid.uuid4().hex}"
 
-    cuda_image_url = None
-    cuda_output = DATA_OUTPUT_DIR / "cuda_edge.jpg"
-    if request.enable_cuda and cuda_output.exists():
-        cuda_image_url = "/output/cuda_edge.jpg"
-
-    performance = calculate_speedups_from_stdout(completed.stdout)
-    normalized_speedups = performance["speedups"]
-
+    benchmark = flood_report.get("benchmark")
+    if not isinstance(benchmark, dict):
+        raise HTTPException(status_code=500, detail="Flood report is missing benchmark metrics.")
     return {
         "success": True,
-        "input": f"/input/{input_path.name}",
-        "prepared_input": f"/input/{prepared_path.name}",
-        "resolution": request.resolution,
-        "threads": request.threads,
-        "cuda_requested": request.enable_cuda,
-        "cuda_enabled_in_build": cuda_enabled_in_build,
-        "cuda_status": (
-            "available" if cuda_image_url
-            else "unavailable_build" if cuda_requested_but_unavailable
-            else "disabled"
-        ),
-        "cuda_output_available": "cuda" in outputs,
-        "cuda_image_url": cuda_image_url,
         "outputs": outputs,
+        "flood_report": flood_report,
+        "benchmark": benchmark,
+        "benchmark_csv_rows": benchmark_csv_rows[-6:],
         "stdout": completed.stdout,
-        "baseline_time_ms": performance["baseline_time_ms"],
-        "runtimes_ms": performance["runtimes_ms"],
-        "speedups": normalized_speedups,
-        "speedup": {
-            "sequential": normalized_speedups.get("sequential", 1.0),
-            "openmp": next(
-                (
-                    value
-                    for mode, value in normalized_speedups.items()
-                    if "openmp" in mode
-                ),
-                1.0,
-            ),
-            "cuda": normalized_speedups.get(
-                next((mode for mode in normalized_speedups if "cuda" in mode), ""),
-                1.0 if cuda_image_url else None,
-            ),
-        },
     }
 
 
 @app.get("/api/benchmark-results")
 def benchmark_results():
-    if not BENCHMARK_FILE.exists():
-        return JSONResponse(content={"results": []})
-
-    results = []
-    baseline_by_resolution = {}
-    try:
-        with BENCHMARK_FILE.open("r", newline="", encoding="utf-8") as file:
-            for row in csv.reader(file):
-                if len(row) < 4:
-                    continue
-                mode, resolution, execution_time, throughput = row[:4]
-                try:
-                    execution_ms = float(execution_time)
-                    throughput_mpps = float(throughput)
-                except ValueError:
-                    continue
-                if not mode.strip():
-                    continue
-                resolution_key = resolution.strip()
-                if "Sequential" in mode:
-                    baseline_by_resolution[resolution_key] = execution_ms
-                baseline = baseline_by_resolution.get(resolution_key)
-                speedup = (
-                    round(baseline / execution_ms, 2)
-                    if baseline and baseline > 0 and execution_ms > 0
-                    else 1.0 if "Sequential" in mode else None
-                )
-                results.append(
-                    {
-                        "mode": mode.strip(),
-                        "resolution": resolution.strip(),
-                        "execution_time_ms": execution_ms,
-                        "throughput_mpps": throughput_mpps,
-                        "speedup": speedup,
-                    }
-                )
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to read benchmark results: {exc}") from exc
-
-    return {"results": results}
+    latest_benchmark = None
+    if FLOOD_REPORT_FILE.exists():
+        try:
+            with FLOOD_REPORT_FILE.open("r", encoding="utf-8") as report_file:
+                latest_benchmark = json.load(report_file).get("benchmark")
+        except (OSError, json.JSONDecodeError):
+            latest_benchmark = None
+    return JSONResponse(content={
+        "results": read_benchmark_csv(),
+        "latest_benchmark": latest_benchmark,
+    })
 
 
 app.mount("/output", StaticFiles(directory=DATA_OUTPUT_DIR), name="output")

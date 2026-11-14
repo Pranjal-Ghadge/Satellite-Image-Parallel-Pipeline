@@ -3,8 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Satellite Parallel Pipeline</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>Satellite Flood Inundation Mapping</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/styles.css">
 </head>
@@ -14,8 +13,8 @@
         <div class="brand-lockup">
             <div class="brand-mark">SI</div>
             <div>
-                <p class="eyebrow">Satellite Image Processing</p>
-                <h1>High-Performance Parallel Pipeline for Real-Time Satellite Image Filtering</h1>
+                <p class="eyebrow">SAR Change Detection</p>
+                <h1>Satellite Flood Inundation Mapping System</h1>
             </div>
         </div>
         <div class="status-pill"><span id="statusDot"></span><b id="systemStatus">System Ready</b></div>
@@ -23,37 +22,39 @@
 
     <main>
         <section class="control-panel glass-panel">
-            <div class="upload-zone" id="uploadZone">
-                <input type="file" id="imageInput" accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff">
-                <div class="upload-icon">↑</div>
-                <strong>Drop a satellite image here</strong>
-                <span>or click to browse</span>
-            </div>
-
-            <div class="control-grid">
-                <label>
-                    Resolution
-                    <select id="resolution">
-                        <option value="512x512">512 × 512</option>
-                        <option value="1024x1024" selected>1024 × 1024</option>
-                        <option value="4096x4096">4096 × 4096</option>
-                    </select>
+            <div class="upload-grid">
+                <label class="upload-card" for="preImageInput">
+                    <span class="upload-icon">↑</span>
+                    <strong>Pre-Flood Satellite Image</strong>
+                    <span id="preFileName">Choose or drop image</span>
+                    <input type="file" id="preImageInput" accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff">
                 </label>
-                <label>
-                    OpenMP Threads
-                    <select id="threads">
-                        <option value="2">2 threads</option>
-                        <option value="4">4 threads</option>
-                        <option value="8" selected>8 threads</option>
-                        <option value="16">16 threads</option>
-                    </select>
+                <label class="upload-card" for="postImageInput">
+                    <span class="upload-icon">↑</span>
+                    <strong>Post-Flood Satellite Image</strong>
+                    <span id="postFileName">Choose or drop image</span>
+                    <input type="file" id="postImageInput" accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff">
+                </label>
+                <label class="upload-card optional-upload" for="groundTruthInput">
+                    <span class="upload-icon">＋</span>
+                    <strong>Ground-Truth Mask <small>(optional)</small></strong>
+                    <span id="groundTruthFileName">Optional binary reference mask</span>
+                    <input type="file" id="groundTruthInput" accept=".jpg,.jpeg,.png,.bmp,.tif,.tiff">
+                </label>
+            </div>
+            <div class="control-grid">
+                <label>Pixel size (meters / pixel)
+                    <input id="pixelSize" type="number" min="0.000001" step="any" placeholder="Use world file or 10 m">
+                </label>
+                <label>Manual water threshold (0–1)
+                    <input id="threshold" type="number" min="0" max="1" step="0.01" value="0.25">
                 </label>
                 <label class="toggle-row">
-                    <span>Enable CUDA</span>
-                    <input type="checkbox" id="cudaToggle">
+                    <span>Use automatic Otsu threshold</span>
+                    <input type="checkbox" id="autoThreshold">
                 </label>
-                <button id="advancedButton" type="button" class="secondary-button">Advanced Settings</button>
-                <button id="runButton" type="button">Run Benchmark</button>
+                <button id="uploadButton" type="button" class="secondary-button">Upload selected files</button>
+                <button id="runButton" type="button">Run flood analysis &amp; benchmark</button>
             </div>
         </section>
 
@@ -68,78 +69,67 @@
 
         <section>
             <div class="section-heading">
-                <div><p class="eyebrow">Image Results</p><h2>Processing Comparison</h2></div>
+                <div><p class="eyebrow">Flood Products</p><h2>Pre / Post Inundation Comparison</h2></div>
                 <button id="resetZoomButton" type="button" class="secondary-button">Reset synchronized view</button>
             </div>
             <div class="image-grid">
-                <article class="image-card glass-panel" data-view="input">
-                    <div class="card-header"><span>Input Image</span><div class="meta-badges" id="inputMeta"></div></div>
-                    <div class="image-frame"><img id="inputImage" alt="Input image"><span class="placeholder">No image selected</span></div>
-                    <a id="downloadInput" class="download" hidden download>Download</a>
+                <article class="image-card glass-panel">
+                    <div class="card-header"><span>Pre-Flood Imagery</span><div class="meta-badges" id="preMeta"></div></div>
+                    <div class="image-frame"><img id="preImage" alt="Pre-flood satellite imagery"><span class="placeholder">Upload pre-flood image</span></div>
+                    <a id="downloadPre" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card glass-panel" data-view="sequential">
-                    <div class="card-header"><span>Sequential CPU</span><div class="meta-badges" id="sequentialMeta"></div></div>
-                    <div class="image-frame"><img id="sequentialImage" alt="Sequential edge map"><span class="speedup-badge" id="sequentialSpeedup">1.00x Baseline</span><span class="placeholder">Awaiting run</span></div>
-                    <a id="downloadSequential" class="download" hidden download>Download</a>
+                <article class="image-card glass-panel">
+                    <div class="card-header"><span>Post-Flood Imagery</span><div class="meta-badges" id="postMeta"></div></div>
+                    <div class="image-frame"><img id="postImage" alt="Post-flood satellite imagery"><span class="placeholder">Upload post-flood image</span></div>
+                    <a id="downloadPost" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card glass-panel" data-view="openmp">
-                    <div class="card-header"><span>OpenMP CPU</span><div class="meta-badges" id="openmpMeta"></div></div>
-                    <div class="image-frame"><img id="openmpImage" alt="OpenMP edge map"><span class="speedup-badge" id="openmpSpeedup">Awaiting run</span><span class="placeholder">Awaiting run</span></div>
-                    <a id="downloadOpenmp" class="download" hidden download>Download</a>
+                <article class="image-card glass-panel">
+                    <div class="card-header"><span>Permanent Water Mask</span><div class="meta-badges" id="permanentMeta"></div></div>
+                    <div class="image-frame"><img id="permanentMask" alt="Pre-flood permanent water mask"><span class="placeholder">Awaiting analysis</span></div>
+                    <a id="downloadPermanent" class="download" hidden download>Download</a>
                 </article>
-                <article class="image-card glass-panel" data-view="cuda">
-                    <div class="card-header"><span>CUDA GPU</span><div class="meta-badges" id="cudaMeta"></div></div>
-                    <div class="image-frame"><img id="cuda-img" alt="CUDA edge map"><span class="speedup-badge" id="cudaSpeedup">CUDA Disabled</span><span class="placeholder" id="cudaPlaceholder">CUDA Disabled</span></div>
-                    <a id="downloadCuda" class="download" hidden download>Download</a>
+                <article class="image-card glass-panel">
+                    <div class="card-header"><span>Final Flood Inundation Mask</span><div class="meta-badges" id="floodMeta"></div></div>
+                    <div class="image-frame"><img id="floodMask" alt="New flood inundation mask"><span class="placeholder">Awaiting analysis</span></div>
+                    <a id="downloadFlood" class="download" hidden download>Download</a>
                 </article>
-            </div>
-        </section>
-
-        <section class="split-section glass-panel">
-            <div class="split-toolbar">
-                <div><p class="eyebrow">Before / After</p><h2>Interactive Comparison</h2></div>
-                <label>Processed view
-                    <select id="splitProcessed">
-                        <option value="openmpImage">OpenMP Edge Map</option>
-                        <option value="sequentialImage">Sequential Edge Map</option>
-                        <option value="cuda-img">CUDA Edge Map</option>
-                    </select>
-                </label>
-            </div>
-            <div class="split-viewer" id="splitViewer">
-                <img id="splitBefore" alt="Original image">
-                <div class="split-after-wrap" id="splitAfterWrap"><img id="splitAfter" alt="Processed edge map"></div>
-                <div class="split-divider" id="splitDivider"><span>↔</span></div>
+                <article class="image-card glass-panel overlay-card">
+                    <div class="card-header"><span>Color-Coded Flood Overlay</span><div class="meta-badges" id="overlayMeta"></div></div>
+                    <div class="image-frame"><img id="floodOverlay" alt="Color-coded flood overlay on post-flood imagery"><span class="placeholder">Awaiting analysis</span></div>
+                    <a id="downloadOverlay" class="download" hidden download>Download</a>
+                </article>
             </div>
         </section>
 
         <section>
             <div class="section-heading">
-                <div><p class="eyebrow">Performance</p><h2>Benchmark Analytics</h2></div>
+                <div><p class="eyebrow">Area &amp; Runtime Summary</p><h2>Flood Mapping KPIs</h2></div>
             </div>
-            <div class="metric-grid">
-                <article class="glass-panel"><span>Peak Speedup Achieved</span><strong id="peakCpu">—</strong><small>S<sub>p</sub> against sequential baseline</small></article>
-                <article class="glass-panel"><span>GPU Acceleration</span><strong id="gpuTime">—</strong><small>GPU throughput MP/s</small></article>
-                <article class="glass-panel"><span>Total Time Savings</span><strong id="totalSavings">—</strong><small>versus sequential baseline</small></article>
+            <div class="metric-grid flood-metrics">
+                <article class="glass-panel"><span>Estimated Inundated Area</span><strong id="floodArea">—</strong><small id="floodAreaHa">Hectares: —</small></article>
+                <article class="glass-panel"><span>Permanent vs. Newly Flooded Water</span><strong id="waterBreakdown">—</strong><small id="waterBreakdownDetail">Permanent / new inundation (km²)</small></article>
+                <article class="glass-panel"><span>Sequential Execution Time (T₁)</span><strong id="sequentialTime">—</strong><small>Complete sequential pipeline (ms)</small></article>
+                <article class="glass-panel"><span>Parallel Execution Time (Tₚ)</span><strong id="parallelTime">—</strong><small id="parallelSummary">Fastest OpenMP run</small></article>
+                <article class="glass-panel"><span>Speedup &amp; Parallel Efficiency</span><strong id="peakSpeedup">—</strong><small id="parallelEfficiency">Peak speedup / efficiency</small></article>
+                <article class="glass-panel verification-card"><span>Sequential vs. OpenMP Verification</span><strong id="verificationStatus">Awaiting run</strong><small id="verificationDetail">Exact pixel equivalence status</small></article>
+            </div>
+        </section>
+
+        <section>
+            <div class="section-heading">
+                <div><p class="eyebrow">Performance</p><h2>OpenMP Scaling — 1, 2, 4, 8, 16 Threads</h2></div>
             </div>
             <div class="chart-grid">
-                <article class="chart-card glass-panel"><h3>Execution Latency</h3><canvas id="timeChart"></canvas></article>
-                <article class="chart-card glass-panel"><h3>Throughput Scaling</h3><canvas id="throughputChart"></canvas></article>
+                <article class="chart-card glass-panel"><h3>Execution Time (ms)</h3><canvas id="timeChart"></canvas></article>
+                <article class="chart-card glass-panel"><h3>Speedup (Sₚ)</h3><canvas id="speedupChart"></canvas></article>
+                <article class="chart-card glass-panel"><h3>Parallel Efficiency (%)</h3><canvas id="efficiencyChart"></canvas></article>
             </div>
         </section>
     </main>
 
-    <aside class="advanced-drawer" id="advancedDrawer" aria-hidden="true">
-        <div class="drawer-header"><div><p class="eyebrow">Pipeline Controls</p><h2>Advanced Settings</h2></div><button id="closeAdvanced" type="button">×</button></div>
-        <label>Gaussian kernel<select id="kernelSize"><option value="3">3 × 3</option><option value="5" selected>5 × 5</option><option value="7">7 × 7</option></select></label>
-        <label>OMP scheduling policy<select id="ompSchedule"><option value="static">static</option><option value="dynamic" selected>dynamic</option></select></label>
-        <div class="drawer-note">Settings are sent with the benchmark request and shown in the execution log.</div>
-    </aside>
-    <div class="drawer-backdrop" id="drawerBackdrop"></div>
-
     <div class="modal" id="imageModal" aria-hidden="true">
         <button id="closeModal" class="modal-close" type="button" aria-label="Close preview">×</button>
-        <img id="modalImage" alt="Full-screen image preview">
+        <img id="modalImage" alt="Full-size flood map preview">
     </div>
     <div id="toast" role="status"></div>
     <script src="/app.js"></script>
