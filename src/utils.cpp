@@ -439,6 +439,75 @@ bool compute_flood_area_statistics(
     return true;
 }
 
+bool compute_flood_accuracy_metrics(
+    const cv::Mat& predicted_flood_mask,
+    const cv::Mat& ground_truth_mask,
+    FloodAccuracyMetrics& metrics,
+    std::string& error) {
+    if (predicted_flood_mask.empty() || ground_truth_mask.empty() ||
+        predicted_flood_mask.type() != CV_8UC1 ||
+        ground_truth_mask.type() != CV_8UC1 ||
+        predicted_flood_mask.size() != ground_truth_mask.size()) {
+        error = "Accuracy evaluation requires matching, non-empty CV_8UC1 flood masks.";
+        return false;
+    }
+
+    FloodAccuracyMetrics computed;
+    for (int y = 0; y < predicted_flood_mask.rows; ++y) {
+        const std::uint8_t* predicted =
+            predicted_flood_mask.ptr<std::uint8_t>(y);
+        const std::uint8_t* reference =
+            ground_truth_mask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < predicted_flood_mask.cols; ++x) {
+            if ((predicted[x] != 0 && predicted[x] != 255) ||
+                (reference[x] != 0 && reference[x] != 255)) {
+                error = "Accuracy evaluation requires masks containing only 0 and 255 values.";
+                return false;
+            }
+
+            const bool predicted_flood = predicted[x] == 255;
+            const bool reference_flood = reference[x] == 255;
+            if (predicted_flood && reference_flood) {
+                ++computed.true_positives;
+            } else if (predicted_flood) {
+                ++computed.false_positives;
+            } else if (reference_flood) {
+                ++computed.false_negatives;
+            } else {
+                ++computed.true_negatives;
+            }
+        }
+    }
+
+    const auto ratio_or_zero = [](std::uint64_t numerator, std::uint64_t denominator) {
+        return denominator == 0
+            ? 0.0
+            : static_cast<double>(numerator) / static_cast<double>(denominator);
+    };
+    computed.precision = ratio_or_zero(
+        computed.true_positives,
+        computed.true_positives + computed.false_positives);
+    computed.recall = ratio_or_zero(
+        computed.true_positives,
+        computed.true_positives + computed.false_negatives);
+    computed.f1_score = ratio_or_zero(
+        2 * computed.true_positives,
+        2 * computed.true_positives + computed.false_positives +
+            computed.false_negatives);
+    computed.intersection_over_union = ratio_or_zero(
+        computed.true_positives,
+        computed.true_positives + computed.false_positives +
+            computed.false_negatives);
+    const std::uint64_t total_pixels =
+        computed.true_positives + computed.false_positives +
+        computed.false_negatives + computed.true_negatives;
+    computed.overall_accuracy = ratio_or_zero(
+        computed.true_positives + computed.true_negatives, total_pixels);
+    computed.evaluated = true;
+    metrics = computed;
+    return true;
+}
+
 bool write_flood_report(
     const std::string& output_path,
     const std::string& pre_image_path,
@@ -452,11 +521,20 @@ bool write_flood_report(
     float post_threshold,
     int minimum_patch_pixels,
     const std::vector<BenchmarkResult>& benchmarks,
+    const FloodAccuracyMetrics& accuracy_metrics,
+    const std::string& ground_truth_path,
     std::string& error) {
     if (width <= 0 || height <= 0 || minimum_patch_pixels <= 0 ||
         !std::isfinite(metadata.pixel_size_x_m) ||
         !std::isfinite(metadata.pixel_size_y_m) ||
-        !std::isfinite(pre_threshold) || !std::isfinite(post_threshold)) {
+        !std::isfinite(pre_threshold) || !std::isfinite(post_threshold) ||
+        (accuracy_metrics.evaluated &&
+            (ground_truth_path.empty() ||
+             !std::isfinite(accuracy_metrics.precision) ||
+             !std::isfinite(accuracy_metrics.recall) ||
+             !std::isfinite(accuracy_metrics.f1_score) ||
+             !std::isfinite(accuracy_metrics.intersection_over_union) ||
+             !std::isfinite(accuracy_metrics.overall_accuracy)))) {
         error = "Cannot write flood report: dimensions or processing parameters are invalid.";
         return false;
     }
@@ -577,8 +655,30 @@ bool write_flood_report(
     report << "    ],\n"
         << "    \"timed_stages\": \"shared pair normalization, Lee despeckling, threshold selection, water segmentation, change detection, and cleanup\",\n"
         << "    \"throughput_definition\": \"both input images in megapixels per second\"\n"
-        << "  }\n"
-        << "}\n";
+        << "  },\n"
+        << "  \"accuracy_metrics\": ";
+    if (accuracy_metrics.evaluated) {
+        report << "{\n"
+            << "    \"evaluated\": true,\n"
+            << "    \"ground_truth_path\": \"" << json_escape(ground_truth_path) << "\",\n"
+            << "    \"confusion_matrix\": {\n"
+            << "      \"true_positives\": " << accuracy_metrics.true_positives << ",\n"
+            << "      \"false_positives\": " << accuracy_metrics.false_positives << ",\n"
+            << "      \"false_negatives\": " << accuracy_metrics.false_negatives << ",\n"
+            << "      \"true_negatives\": " << accuracy_metrics.true_negatives << "\n"
+            << "    },\n"
+            << "    \"precision\": " << accuracy_metrics.precision << ",\n"
+            << "    \"recall_sensitivity\": " << accuracy_metrics.recall << ",\n"
+            << "    \"f1_score_dice_coefficient\": " << accuracy_metrics.f1_score << ",\n"
+            << "    \"intersection_over_union_critical_success_index\": "
+            << accuracy_metrics.intersection_over_union << ",\n"
+            << "    \"overall_accuracy\": " << accuracy_metrics.overall_accuracy << ",\n"
+            << "    \"zero_denominator_policy\": \"metric value is 0.0\"\n"
+            << "  }\n";
+    } else {
+        report << "{ \"evaluated\": false }\n";
+    }
+    report << "}\n";
     if (!report) {
         error = "Failed while writing flood report: " + output_path;
         return false;

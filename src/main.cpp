@@ -140,7 +140,8 @@ void print_usage(const char* executable) {
         << "  " << executable << " --pre <path> --post <path> [--threads N] "
            "[--benchmark] "
            "[--threshold value | --auto-threshold] "
-           "[--min-patch-pixels N] [--pixel-size meters] "
+           "[--min-patch-pixels N] [--ground-truth mask_path] "
+           "[--pixel-size meters] "
            "[--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --help\n\n"
         << "Legacy single-image mode runs the Gaussian+Sobel benchmark.\n"
@@ -156,6 +157,7 @@ void print_usage(const char* executable) {
         << "  --threshold value            Manual dark-water threshold on [0, 1] (default 0.25)\n"
         << "  --auto-threshold             Compute an Otsu threshold independently per image\n"
         << "  --min-patch-pixels N         Minimum retained flood patch area (default 25)\n"
+        << "  --ground-truth <path>        Optional binary reference flood mask for accuracy metrics\n"
         << "  --pixel-size meters          Pixel size fallback/override in meters (default 10.0)\n"
         << "  --origin-lat deg             Optional origin latitude (-90 to 90)\n"
         << "  --origin-lon deg             Optional origin longitude (-180 to 180)\n"
@@ -279,6 +281,7 @@ int main(int argc, char** argv) {
     std::string input_path = "data/raw/input_1024.jpg";
     std::string pre_path;
     std::string post_path;
+    std::string ground_truth_path;
     std::vector<int> threads_to_test = {2, 4, 8, 16};
     std::vector<int> flood_threads_to_test = {1, 2, 4, 8, 16};
     bool benchmark_requested = false;
@@ -312,7 +315,8 @@ int main(int argc, char** argv) {
         } else if (arg == "--pre" || arg == "--post" || arg == "--threads" ||
             arg == "--resolution" || arg == "--pixel-size" ||
             arg == "--origin-lat" || arg == "--origin-lon" ||
-            arg == "--threshold" || arg == "--min-patch-pixels") {
+            arg == "--threshold" || arg == "--min-patch-pixels" ||
+            arg == "--ground-truth") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: Missing value for " << arg << ".\n";
                 print_usage(argv[0]);
@@ -324,6 +328,12 @@ int main(int argc, char** argv) {
                 pre_path = value;
             } else if (arg == "--post") {
                 post_path = value;
+            } else if (arg == "--ground-truth") {
+                if (value.empty()) {
+                    std::cerr << "Error: --ground-truth requires a non-empty mask path.\n";
+                    return 2;
+                }
+                ground_truth_path = value;
             } else if (arg == "--threads") {
                 int requested_threads = 0;
                 if (!parse_positive_integer(value, requested_threads)) {
@@ -401,8 +411,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (!has_pre_path &&
-        (threshold_overridden || auto_threshold || minimum_patch_overridden)) {
-        std::cerr << "Error: Water threshold and patch options require paired-image mode (--pre/--post).\n";
+        (threshold_overridden || auto_threshold || minimum_patch_overridden ||
+         !ground_truth_path.empty())) {
+        std::cerr << "Error: Water threshold, patch, and ground-truth options require paired-image mode (--pre/--post).\n";
         return 2;
     }
     if (has_pre_path && has_positional_input) {
@@ -622,6 +633,35 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        FloodAccuracyMetrics accuracy_metrics;
+        if (!ground_truth_path.empty()) {
+            const cv::Mat ground_truth_source =
+                cv::imread(ground_truth_path, cv::IMREAD_GRAYSCALE);
+            if (ground_truth_source.empty()) {
+                std::cerr << "Error: Could not load ground-truth mask from "
+                          << ground_truth_path << ".\n";
+                return 1;
+            }
+            if (ground_truth_source.size() != new_flood_mask.size()) {
+                std::cerr << "Error: Ground-truth mask dimensions ("
+                          << ground_truth_source.cols << "x"
+                          << ground_truth_source.rows
+                          << ") do not match predicted flood mask ("
+                          << new_flood_mask.cols << "x"
+                          << new_flood_mask.rows << ").\n";
+                return 1;
+            }
+
+            cv::Mat ground_truth_mask;
+            cv::threshold(
+                ground_truth_source, ground_truth_mask, 0, 255, cv::THRESH_BINARY);
+            if (!compute_flood_accuracy_metrics(
+                    new_flood_mask, ground_truth_mask, accuracy_metrics, error)) {
+                std::cerr << "Error: " << error << std::endl;
+                return 1;
+            }
+        }
+
         cv::Mat pre_water_visualization;
         cv::Mat post_water_visualization;
         cv::Mat flood_overlay;
@@ -663,7 +703,8 @@ int main(int argc, char** argv) {
                 pre_intensity.cols, pre_intensity.rows, metadata,
                 area_statistics, auto_threshold,
                 pre_active_threshold, post_active_threshold,
-                minimum_patch_pixels, benchmark_results, error)) {
+                minimum_patch_pixels, benchmark_results,
+                accuracy_metrics, ground_truth_path, error)) {
             std::cerr << "Error: " << error << std::endl;
             return 1;
         }
@@ -696,8 +737,25 @@ int main(int argc, char** argv) {
                   << area_statistics.new_flood_percentage_of_scene
                   << "% of scene)\n"
                   << "  Receded water: " << area_statistics.receded_water_km2
-                  << " km^2\n"
-                  << "Water masks matched across active implementations.\n"
+                  << " km^2\n";
+        if (accuracy_metrics.evaluated) {
+            std::cout << "Ground-truth accuracy metrics:\n"
+                      << "  Confusion matrix (TP/FP/FN/TN): "
+                      << accuracy_metrics.true_positives << "/"
+                      << accuracy_metrics.false_positives << "/"
+                      << accuracy_metrics.false_negatives << "/"
+                      << accuracy_metrics.true_negatives << "\n"
+                      << "  Precision: " << accuracy_metrics.precision << "\n"
+                      << "  Recall (Sensitivity): " << accuracy_metrics.recall << "\n"
+                      << "  F1-Score (Dice): " << accuracy_metrics.f1_score << "\n"
+                      << "  IoU (Critical Success Index): "
+                      << accuracy_metrics.intersection_over_union << "\n"
+                      << "  Overall accuracy: "
+                      << accuracy_metrics.overall_accuracy << "\n";
+        } else {
+            std::cout << "Ground-truth accuracy evaluation skipped (no --ground-truth provided).\n";
+        }
+        std::cout << "Water masks matched across active implementations.\n"
                   << "Flood and semantic maps match across all enabled implementations.\n"
                   << "Saved data/output/pre_water_mask.png, "
                      "data/output/post_water_mask.png, data/output/flood_mask.png, "

@@ -69,6 +69,19 @@ struct FloodAreaStatistics {
     double receded_water_km2 = 0.0;
 };
 
+struct FloodAccuracyMetrics {
+    bool evaluated = false;
+    std::uint64_t true_positives = 0;
+    std::uint64_t false_positives = 0;
+    std::uint64_t false_negatives = 0;
+    std::uint64_t true_negatives = 0;
+    double precision = 0.0;
+    double recall = 0.0;
+    double f1_score = 0.0;
+    double intersection_over_union = 0.0;
+    double overall_accuracy = 0.0;
+};
+
 struct BenchmarkResult {
     std::string mode;
     std::string pre_image_path;
@@ -100,6 +113,11 @@ bool compute_flood_area_statistics(
     const SpatialMetadata& metadata,
     FloodAreaStatistics& statistics,
     std::string& error);
+bool compute_flood_accuracy_metrics(
+    const cv::Mat& predicted_flood_mask,
+    const cv::Mat& ground_truth_mask,
+    FloodAccuracyMetrics& metrics,
+    std::string& error);
 bool write_flood_report(
     const std::string& output_path,
     const std::string& pre_image_path,
@@ -113,6 +131,8 @@ bool write_flood_report(
     float post_threshold,
     int minimum_patch_pixels,
     const std::vector<BenchmarkResult>& benchmarks,
+    const FloodAccuracyMetrics& accuracy_metrics,
+    const std::string& ground_truth_path,
     std::string& error);
 bool write_flood_csv_report(
     const std::string& output_path,

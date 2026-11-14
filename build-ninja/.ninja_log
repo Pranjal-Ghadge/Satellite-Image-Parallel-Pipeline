@@ -30,3 +30,6 @@
 45	4556	8163790290325815	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	49950b24cb9be6cf
 66	4724	8163790290554728	CMakeFiles/parallel_pipeline.dir/src/utils.cpp.obj	4fce7726a08b5703
 4724	5432	8163790337107102	parallel_pipeline.exe	db17b2acb6058cef
+58	3859	8163793334615591	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	49950b24cb9be6cf
+81	4026	8163793334847762	CMakeFiles/parallel_pipeline.dir/src/utils.cpp.obj	4fce7726a08b5703
+4026	4712	8163793374290992	parallel_pipeline.exe	db17b2acb6058cef
