@@ -6,6 +6,7 @@
 #include <cstring>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -103,6 +104,21 @@ __global__ void lee_filter_kernel(
         (local_variance - noise_variance) / (local_variance + epsilon));
     const float center = input[y * width + x];
     output[y * width + x] = local_mean + weight * (center - local_mean);
+}
+
+__global__ void water_segmentation_kernel(
+    const float* __restrict__ input,
+    unsigned char* __restrict__ output,
+    int width,
+    int height,
+    float threshold)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < width && y < height) {
+        output[y * width + x] =
+            input[y * width + x] <= threshold ? 255 : 0;
+    }
 }
 
 void check_cuda_result(cudaError_t result, const char* operation) {
@@ -211,4 +227,67 @@ void process_lee_cuda(const cv::Mat& input, cv::Mat& output) {
 
     check_cuda_result(cudaFree(device_input), "cudaFree input");
     check_cuda_result(cudaFree(device_output), "cudaFree output");
+}
+
+void segment_water_cuda(
+    const cv::Mat& despeckled,
+    cv::Mat& water_mask,
+    float threshold) {
+    if (despeckled.empty() || despeckled.type() != CV_32FC1) {
+        throw std::invalid_argument(
+            "segment_water_cuda requires a non-empty CV_32FC1 image");
+    }
+    if (!std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+        throw std::invalid_argument("Water threshold must be between 0 and 1");
+    }
+
+    const int width = despeckled.cols;
+    const int height = despeckled.rows;
+    const size_t pixel_count =
+        static_cast<size_t>(width) * static_cast<size_t>(height);
+    const size_t input_bytes = pixel_count * sizeof(float);
+    const size_t output_bytes = pixel_count * sizeof(unsigned char);
+    cv::Mat contiguous_input =
+        despeckled.isContinuous() ? despeckled : despeckled.clone();
+    water_mask.create(despeckled.size(), CV_8UC1);
+
+    float* device_input = nullptr;
+    unsigned char* device_output = nullptr;
+    try {
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_input), input_bytes),
+            "cudaMalloc segmentation input");
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_output), output_bytes),
+            "cudaMalloc segmentation output");
+        check_cuda_result(
+            cudaMemcpy(device_input, contiguous_input.ptr<float>(),
+                input_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy segmentation input");
+
+        const dim3 block_size(16, 16);
+        const dim3 grid_size(
+            (width + block_size.x - 1) / block_size.x,
+            (height + block_size.y - 1) / block_size.y);
+        water_segmentation_kernel<<<grid_size, block_size>>>(
+            device_input, device_output, width, height, threshold);
+        check_cuda_result(cudaGetLastError(), "water segmentation kernel launch");
+        check_cuda_result(
+            cudaDeviceSynchronize(), "water segmentation kernel execution");
+        check_cuda_result(
+            cudaMemcpy(water_mask.ptr<unsigned char>(), device_output,
+                output_bytes, cudaMemcpyDeviceToHost),
+            "cudaMemcpy segmentation output");
+    } catch (...) {
+        if (device_input) {
+            cudaFree(device_input);
+        }
+        if (device_output) {
+            cudaFree(device_output);
+        }
+        throw;
+    }
+
+    check_cuda_result(cudaFree(device_input), "cudaFree segmentation input");
+    check_cuda_result(cudaFree(device_output), "cudaFree segmentation output");
 }

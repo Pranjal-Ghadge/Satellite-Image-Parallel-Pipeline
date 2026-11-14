@@ -5,5 +5,9 @@
 
 void process_cuda(const cv::Mat& input, cv::Mat& output);
 void process_lee_cuda(const cv::Mat& input, cv::Mat& output);
+void segment_water_cuda(
+    const cv::Mat& despeckled,
+    cv::Mat& water_mask,
+    float threshold);
 
 #endif

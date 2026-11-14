@@ -77,3 +77,30 @@ void process_lee_openmp(const cv::Mat& input, cv::Mat& output, int num_threads) 
         }
     }
 }
+
+void segment_water_openmp(
+    const cv::Mat& despeckled,
+    cv::Mat& water_mask,
+    float threshold,
+    int num_threads) {
+    if (despeckled.empty() || despeckled.type() != CV_32FC1) {
+        throw std::invalid_argument(
+            "segment_water_openmp requires a non-empty CV_32FC1 image");
+    }
+    if (!std::isfinite(threshold) || threshold < 0.0f || threshold > 1.0f) {
+        throw std::invalid_argument("Water threshold must be between 0 and 1");
+    }
+    if (num_threads <= 0) {
+        throw std::invalid_argument("OpenMP thread count must be positive");
+    }
+
+    water_mask.create(despeckled.size(), CV_8UC1);
+#pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int y = 0; y < despeckled.rows; ++y) {
+        const float* input_row = despeckled.ptr<float>(y);
+        std::uint8_t* mask_row = water_mask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < despeckled.cols; ++x) {
+            mask_row[x] = is_water_pixel(input_row[x], threshold) ? 255 : 0;
+        }
+    }
+}

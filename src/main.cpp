@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <limits>
 #include <cmath>
+#include <filesystem>
 #include <sstream>
 #include <vector>
 #include <string>
@@ -25,16 +26,19 @@ void print_usage(const char* executable) {
         << "  " << executable << " [image_path] [--threads N] [--resolution WIDTHxHEIGHT] "
            "[--pixel-size meters] [--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --pre <path> --post <path> [--threads N] "
+           "[--threshold value | --auto-threshold] "
            "[--pixel-size meters] [--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --help\n\n"
         << "Legacy single-image mode runs the Gaussian+Sobel benchmark.\n"
-        << "Paired-image mode validates and converts both images to single-channel CV_32F; "
-           "flood detection is not yet implemented.\n"
+        << "Paired-image mode normalizes and despeckles both images, then writes pre/post "
+           "binary water masks.\n"
         << "Options:\n"
         << "  --pre <path>                 Pre-flood image (requires --post)\n"
         << "  --post <path>                Post-flood image (requires --pre)\n"
         << "  --threads N                  OpenMP thread count (legacy benchmark)\n"
         << "  --resolution WIDTHxHEIGHT    Resize legacy single-image input\n"
+        << "  --threshold value            Manual dark-water threshold on [0, 1] (default 0.25)\n"
+        << "  --auto-threshold             Compute an Otsu threshold independently per image\n"
         << "  --pixel-size meters          Pixel size fallback/override in meters (default 10.0)\n"
         << "  --origin-lat deg             Optional origin latitude (-90 to 90)\n"
         << "  --origin-lon deg             Optional origin longitude (-180 to 180)\n"
@@ -110,15 +114,21 @@ int main(int argc, char** argv) {
     bool has_origin_lon = false;
     double origin_lat_deg = 0.0;
     double origin_lon_deg = 0.0;
+    float water_threshold = 0.25f;
+    bool threshold_overridden = false;
+    bool auto_threshold = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
+        } else if (arg == "--auto-threshold") {
+            auto_threshold = true;
         } else if (arg == "--pre" || arg == "--post" || arg == "--threads" ||
             arg == "--resolution" || arg == "--pixel-size" ||
-            arg == "--origin-lat" || arg == "--origin-lon") {
+            arg == "--origin-lat" || arg == "--origin-lon" ||
+            arg == "--threshold") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: Missing value for " << arg << ".\n";
                 print_usage(argv[0]);
@@ -152,6 +162,15 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 pixel_size_overridden = true;
+            } else if (arg == "--threshold") {
+                double parsed_threshold = 0.0;
+                if (!parse_finite_double(value, parsed_threshold) ||
+                    parsed_threshold < 0.0 || parsed_threshold > 1.0) {
+                    std::cerr << "Error: --threshold must be between 0 and 1.\n";
+                    return 2;
+                }
+                water_threshold = static_cast<float>(parsed_threshold);
+                threshold_overridden = true;
             } else if (arg == "--origin-lat") {
                 if (!parse_finite_double(value, origin_lat_deg) ||
                     origin_lat_deg < -90.0 || origin_lat_deg > 90.0) {
@@ -189,12 +208,20 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 2;
     }
+    if (!has_pre_path && (threshold_overridden || auto_threshold)) {
+        std::cerr << "Error: Water threshold options require paired-image mode (--pre/--post).\n";
+        return 2;
+    }
     if (has_pre_path && has_positional_input) {
         std::cerr << "Error: Use either a positional image path or --pre/--post, not both.\n";
         return 2;
     }
     if (has_origin_lat != has_origin_lon) {
         std::cerr << "Error: --origin-lat and --origin-lon must be provided together.\n";
+        return 2;
+    }
+    if (auto_threshold && threshold_overridden) {
+        std::cerr << "Error: --threshold and --auto-threshold cannot be used together.\n";
         return 2;
     }
 
@@ -247,8 +274,29 @@ int main(int argc, char** argv) {
         std::cout << "Sequential Lee filtering (pre + post): "
                   << sequential_time_ms << " ms.\n";
 
+        float pre_active_threshold = water_threshold;
+        float post_active_threshold = water_threshold;
+        if (auto_threshold) {
+            pre_active_threshold = compute_otsu_threshold(pre_sequential);
+            post_active_threshold = compute_otsu_threshold(post_sequential);
+            std::cout << "Automatic Otsu thresholds (dark water, <=): pre="
+                      << pre_active_threshold << ", post=" << post_active_threshold << ".\n";
+        } else {
+            std::cout << "Manual dark-water threshold (<=): "
+                      << water_threshold << ".\n";
+        }
+
+        cv::Mat pre_water_mask;
+        cv::Mat post_water_mask;
+        segment_water_sequential(
+            pre_sequential, pre_water_mask, pre_active_threshold);
+        segment_water_sequential(
+            post_sequential, post_water_mask, post_active_threshold);
+
         cv::Mat pre_openmp;
         cv::Mat post_openmp;
+        cv::Mat pre_openmp_mask;
+        cv::Mat post_openmp_mask;
         for (int thread_count : threads_to_test) {
             preprocessing_timer.start();
             process_lee_openmp(pre_normalized, pre_openmp, thread_count);
@@ -265,6 +313,19 @@ int main(int argc, char** argv) {
                       << std::scientific << max_difference << std::fixed << ".\n";
             if (max_difference != 0.0) {
                 std::cerr << "Error: Sequential and OpenMP Lee outputs do not match exactly.\n";
+                return 1;
+            }
+
+            segment_water_openmp(
+                pre_openmp, pre_openmp_mask, pre_active_threshold, thread_count);
+            segment_water_openmp(
+                post_openmp, post_openmp_mask, post_active_threshold, thread_count);
+            const double pre_mask_difference =
+                cv::norm(pre_water_mask, pre_openmp_mask, cv::NORM_INF);
+            const double post_mask_difference =
+                cv::norm(post_water_mask, post_openmp_mask, cv::NORM_INF);
+            if (pre_mask_difference != 0.0 || post_mask_difference != 0.0) {
+                std::cerr << "Error: Sequential and OpenMP water masks do not match exactly.\n";
                 return 1;
             }
         }
@@ -292,12 +353,47 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: CUDA Lee output differs from sequential beyond tolerance.\n";
                 return 1;
             }
+
+            cv::Mat pre_cuda_mask;
+            cv::Mat post_cuda_mask;
+            segment_water_cuda(
+                pre_sequential, pre_cuda_mask, pre_active_threshold);
+            segment_water_cuda(
+                post_sequential, post_cuda_mask, post_active_threshold);
+            if (cv::norm(pre_water_mask, pre_cuda_mask, cv::NORM_INF) != 0.0 ||
+                cv::norm(post_water_mask, post_cuda_mask, cv::NORM_INF) != 0.0) {
+                std::cerr << "Error: CUDA and sequential water masks do not match exactly.\n";
+                return 1;
+            }
         } catch (const std::exception& exception) {
             std::cerr << "Error: CUDA Lee preprocessing failed: "
                       << exception.what() << std::endl;
             return 1;
         }
 #endif
+
+        try {
+            std::filesystem::create_directories("data/output");
+        } catch (const std::filesystem::filesystem_error& exception) {
+            std::cerr << "Error: Unable to create data/output: "
+                      << exception.what() << std::endl;
+            return 1;
+        }
+        if (!cv::imwrite("data/output/pre_water_mask.png", pre_water_mask) ||
+            !cv::imwrite("data/output/post_water_mask.png", post_water_mask)) {
+            std::cerr << "Error: Unable to write water mask outputs to data/output/.\n";
+            return 1;
+        }
+
+        const int pre_water_pixels = cv::countNonZero(pre_water_mask);
+        const int post_water_pixels = cv::countNonZero(post_water_mask);
+        std::cout << "Water masks matched across active implementations.\n"
+                  << "Pre-water pixels: " << pre_water_pixels << " / "
+                  << pre_water_mask.total() << ".\n"
+                  << "Post-water pixels: " << post_water_pixels << " / "
+                  << post_water_mask.total() << ".\n"
+                  << "Saved binary masks: data/output/pre_water_mask.png and "
+                     "data/output/post_water_mask.png.\n";
         return 0;
     }
 
