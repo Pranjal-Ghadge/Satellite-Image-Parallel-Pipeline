@@ -293,10 +293,17 @@ int main(int argc, char** argv) {
         segment_water_sequential(
             post_sequential, post_water_mask, post_active_threshold);
 
+        cv::Mat new_flood_mask;
+        cv::Mat semantic_map;
+        detect_flood_change_sequential(
+            pre_water_mask, post_water_mask, new_flood_mask, semantic_map);
+
         cv::Mat pre_openmp;
         cv::Mat post_openmp;
         cv::Mat pre_openmp_mask;
         cv::Mat post_openmp_mask;
+        cv::Mat openmp_flood_mask;
+        cv::Mat openmp_semantic_map;
         for (int thread_count : threads_to_test) {
             preprocessing_timer.start();
             process_lee_openmp(pre_normalized, pre_openmp, thread_count);
@@ -326,6 +333,15 @@ int main(int argc, char** argv) {
                 cv::norm(post_water_mask, post_openmp_mask, cv::NORM_INF);
             if (pre_mask_difference != 0.0 || post_mask_difference != 0.0) {
                 std::cerr << "Error: Sequential and OpenMP water masks do not match exactly.\n";
+                return 1;
+            }
+
+            detect_flood_change_openmp(
+                pre_openmp_mask, post_openmp_mask,
+                openmp_flood_mask, openmp_semantic_map, thread_count);
+            if (cv::norm(new_flood_mask, openmp_flood_mask, cv::NORM_INF) != 0.0 ||
+                cv::norm(semantic_map, openmp_semantic_map, cv::NORM_INF) != 0.0) {
+                std::cerr << "Error: Sequential and OpenMP flood/class maps do not match exactly.\n";
                 return 1;
             }
         }
@@ -365,8 +381,19 @@ int main(int argc, char** argv) {
                 std::cerr << "Error: CUDA and sequential water masks do not match exactly.\n";
                 return 1;
             }
+
+            cv::Mat cuda_flood_mask;
+            cv::Mat cuda_semantic_map;
+            detect_flood_change_cuda(
+                pre_cuda_mask, post_cuda_mask,
+                cuda_flood_mask, cuda_semantic_map);
+            if (cv::norm(new_flood_mask, cuda_flood_mask, cv::NORM_INF) != 0.0 ||
+                cv::norm(semantic_map, cuda_semantic_map, cv::NORM_INF) != 0.0) {
+                std::cerr << "Error: CUDA and sequential flood/class maps do not match exactly.\n";
+                return 1;
+            }
         } catch (const std::exception& exception) {
-            std::cerr << "Error: CUDA Lee preprocessing failed: "
+            std::cerr << "Error: CUDA flood pipeline failed: "
                       << exception.what() << std::endl;
             return 1;
         }
@@ -380,8 +407,10 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (!cv::imwrite("data/output/pre_water_mask.png", pre_water_mask) ||
-            !cv::imwrite("data/output/post_water_mask.png", post_water_mask)) {
-            std::cerr << "Error: Unable to write water mask outputs to data/output/.\n";
+            !cv::imwrite("data/output/post_water_mask.png", post_water_mask) ||
+            !cv::imwrite("data/output/new_flood_mask.png", new_flood_mask) ||
+            !cv::imwrite("data/output/semantic_classification.png", semantic_map)) {
+            std::cerr << "Error: Unable to write water/flood classification masks to data/output/.\n";
             return 1;
         }
 
@@ -392,8 +421,11 @@ int main(int argc, char** argv) {
                   << pre_water_mask.total() << ".\n"
                   << "Post-water pixels: " << post_water_pixels << " / "
                   << post_water_mask.total() << ".\n"
-                  << "Saved binary masks: data/output/pre_water_mask.png and "
-                     "data/output/post_water_mask.png.\n";
+                  << "Flood and semantic maps match across all enabled implementations.\n"
+                  << "Saved masks: data/output/pre_water_mask.png, "
+                     "data/output/post_water_mask.png, data/output/new_flood_mask.png, "
+                     "data/output/semantic_classification.png (0=dry, 1=permanent water, "
+                     "2=new flood, 3=receded water).\n";
         return 0;
     }
 

@@ -115,4 +115,20 @@ inline bool is_water_pixel(float backscatter, float threshold) {
     return backscatter <= threshold;
 }
 
+inline bool is_binary_water_mask(const cv::Mat& mask) {
+    if (mask.empty() || mask.type() != CV_8UC1) {
+        return false;
+    }
+
+    for (int y = 0; y < mask.rows; ++y) {
+        const std::uint8_t* row = mask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < mask.cols; ++x) {
+            if (row[x] != 0 && row[x] != 255) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 #endif

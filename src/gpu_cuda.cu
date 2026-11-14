@@ -1,4 +1,5 @@
 #include "gpu_cuda.h"
+#include "sar_preprocessing.h"
 
 #include <cuda_runtime.h>
 #include <opencv2/opencv.hpp>
@@ -118,6 +119,27 @@ __global__ void water_segmentation_kernel(
     if (x < width && y < height) {
         output[y * width + x] =
             input[y * width + x] <= threshold ? 255 : 0;
+    }
+}
+
+__global__ void flood_change_kernel(
+    const unsigned char* __restrict__ pre_water,
+    const unsigned char* __restrict__ post_water,
+    unsigned char* __restrict__ new_flood,
+    unsigned char* __restrict__ semantic,
+    int width,
+    int height)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x < width && y < height) {
+        const int index = y * width + x;
+        const bool was_water = pre_water[index] == 255;
+        const bool is_water = post_water[index] == 255;
+        new_flood[index] = (!was_water && is_water) ? 255 : 0;
+        semantic[index] = !was_water
+            ? (is_water ? 2 : 0)
+            : (is_water ? 1 : 3);
     }
 }
 
@@ -290,4 +312,83 @@ void segment_water_cuda(
 
     check_cuda_result(cudaFree(device_input), "cudaFree segmentation input");
     check_cuda_result(cudaFree(device_output), "cudaFree segmentation output");
+}
+
+void detect_flood_change_cuda(
+    const cv::Mat& pre_water_mask,
+    const cv::Mat& post_water_mask,
+    cv::Mat& new_flood_mask,
+    cv::Mat& semantic_map) {
+    if (!is_binary_water_mask(pre_water_mask) ||
+        !is_binary_water_mask(post_water_mask) ||
+        pre_water_mask.size() != post_water_mask.size()) {
+        throw std::invalid_argument(
+            "Flood change detection requires matching binary CV_8UC1 water masks");
+    }
+
+    const int width = pre_water_mask.cols;
+    const int height = pre_water_mask.rows;
+    const size_t image_bytes =
+        static_cast<size_t>(width) * static_cast<size_t>(height);
+    cv::Mat contiguous_pre =
+        pre_water_mask.isContinuous() ? pre_water_mask : pre_water_mask.clone();
+    cv::Mat contiguous_post =
+        post_water_mask.isContinuous() ? post_water_mask : post_water_mask.clone();
+    new_flood_mask.create(pre_water_mask.size(), CV_8UC1);
+    semantic_map.create(pre_water_mask.size(), CV_8UC1);
+
+    unsigned char* device_pre = nullptr;
+    unsigned char* device_post = nullptr;
+    unsigned char* device_flood = nullptr;
+    unsigned char* device_semantic = nullptr;
+    try {
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_pre), image_bytes),
+            "cudaMalloc pre-water mask");
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_post), image_bytes),
+            "cudaMalloc post-water mask");
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_flood), image_bytes),
+            "cudaMalloc new-flood mask");
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_semantic), image_bytes),
+            "cudaMalloc semantic map");
+        check_cuda_result(
+            cudaMemcpy(device_pre, contiguous_pre.ptr<unsigned char>(),
+                image_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy pre-water mask");
+        check_cuda_result(
+            cudaMemcpy(device_post, contiguous_post.ptr<unsigned char>(),
+                image_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy post-water mask");
+
+        const dim3 block_size(16, 16);
+        const dim3 grid_size(
+            (width + block_size.x - 1) / block_size.x,
+            (height + block_size.y - 1) / block_size.y);
+        flood_change_kernel<<<grid_size, block_size>>>(
+            device_pre, device_post, device_flood, device_semantic, width, height);
+        check_cuda_result(cudaGetLastError(), "flood-change kernel launch");
+        check_cuda_result(cudaDeviceSynchronize(), "flood-change kernel execution");
+        check_cuda_result(
+            cudaMemcpy(new_flood_mask.ptr<unsigned char>(), device_flood,
+                image_bytes, cudaMemcpyDeviceToHost),
+            "cudaMemcpy new-flood mask");
+        check_cuda_result(
+            cudaMemcpy(semantic_map.ptr<unsigned char>(), device_semantic,
+                image_bytes, cudaMemcpyDeviceToHost),
+            "cudaMemcpy semantic map");
+    } catch (...) {
+        if (device_pre) cudaFree(device_pre);
+        if (device_post) cudaFree(device_post);
+        if (device_flood) cudaFree(device_flood);
+        if (device_semantic) cudaFree(device_semantic);
+        throw;
+    }
+
+    check_cuda_result(cudaFree(device_pre), "cudaFree pre-water mask");
+    check_cuda_result(cudaFree(device_post), "cudaFree post-water mask");
+    check_cuda_result(cudaFree(device_flood), "cudaFree new-flood mask");
+    check_cuda_result(cudaFree(device_semantic), "cudaFree semantic map");
 }

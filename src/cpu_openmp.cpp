@@ -104,3 +104,38 @@ void segment_water_openmp(
         }
     }
 }
+
+void detect_flood_change_openmp(
+    const cv::Mat& pre_water_mask,
+    const cv::Mat& post_water_mask,
+    cv::Mat& new_flood_mask,
+    cv::Mat& semantic_map,
+    int num_threads) {
+    if (!is_binary_water_mask(pre_water_mask) ||
+        !is_binary_water_mask(post_water_mask) ||
+        pre_water_mask.size() != post_water_mask.size()) {
+        throw std::invalid_argument(
+            "Flood change detection requires matching binary CV_8UC1 water masks");
+    }
+    if (num_threads <= 0) {
+        throw std::invalid_argument("OpenMP thread count must be positive");
+    }
+
+    new_flood_mask.create(pre_water_mask.size(), CV_8UC1);
+    semantic_map.create(pre_water_mask.size(), CV_8UC1);
+#pragma omp parallel for schedule(static) num_threads(num_threads)
+    for (int y = 0; y < pre_water_mask.rows; ++y) {
+        const std::uint8_t* pre_row = pre_water_mask.ptr<std::uint8_t>(y);
+        const std::uint8_t* post_row = post_water_mask.ptr<std::uint8_t>(y);
+        std::uint8_t* flood_row = new_flood_mask.ptr<std::uint8_t>(y);
+        std::uint8_t* semantic_row = semantic_map.ptr<std::uint8_t>(y);
+        for (int x = 0; x < pre_water_mask.cols; ++x) {
+            const bool was_water = pre_row[x] == 255;
+            const bool is_water = post_row[x] == 255;
+            flood_row[x] = (!was_water && is_water) ? 255 : 0;
+            semantic_row[x] = !was_water
+                ? (is_water ? 2 : 0)
+                : (is_water ? 1 : 3);
+        }
+    }
+}

@@ -9,5 +9,10 @@ void segment_water_sequential(
     const cv::Mat& despeckled,
     cv::Mat& water_mask,
     float threshold);
+void detect_flood_change_sequential(
+    const cv::Mat& pre_water_mask,
+    const cv::Mat& post_water_mask,
+    cv::Mat& new_flood_mask,
+    cv::Mat& semantic_map);
 
 #endif
