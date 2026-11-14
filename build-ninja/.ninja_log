@@ -4,3 +4,10 @@
 15	1814	8159470991475343	CMakeFiles/parallel_pipeline.dir/src/utils.cpp.obj	cdf2e87cfb79e81a
 3	1953	8159470991350151	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	cceda6dc303bfe24
 1954	2782	8159471010865283	parallel_pipeline.exe	7f8fbe38d6df982d
+119	2707	8163549078363881	CMakeFiles/parallel_pipeline.dir/src/cpu_openmp.cpp.obj	16c1da6167b034de
+106	2750	8163549078235757	CMakeFiles/parallel_pipeline.dir/src/cpu_sequential.cpp.obj	7f7a0e4fedfbc5c7
+93	2766	8163549078102571	CMakeFiles/parallel_pipeline.dir/src/utils.cpp.obj	cdf2e87cfb79e81a
+69	2831	8163549077862330	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	cceda6dc303bfe24
+2831	3613	8163549105490639	parallel_pipeline.exe	7f8fbe38d6df982d
+44	2642	8163565311669176	CMakeFiles/parallel_pipeline.dir/src/main.cpp.obj	cceda6dc303bfe24
+2643	3335	8163565337666991	parallel_pipeline.exe	7f8fbe38d6df982d

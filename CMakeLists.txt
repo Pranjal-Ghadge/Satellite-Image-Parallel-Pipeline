@@ -19,11 +19,21 @@ endif()
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED)
 
+find_package(GDAL CONFIG QUIET)
+if(GDAL_FOUND)
+    if(GDAL_VERSION VERSION_LESS "3.0")
+        message(FATAL_ERROR "GDAL 3.0 or newer is required; found GDAL ${GDAL_VERSION}.")
+    endif()
+else()
+    find_package(GDAL 3.0 REQUIRED MODULE)
+endif()
+
 set(SOURCES
     src/main.cpp
     src/utils.cpp
     src/cpu_sequential.cpp
     src/cpu_openmp.cpp
+    src/satellite_dataset.cpp
 )
 
 if(USE_CUDA)
@@ -48,7 +58,25 @@ target_compile_definitions(parallel_pipeline PRIVATE
 target_link_libraries(parallel_pipeline PRIVATE
     ${OpenCV_LIBS}
     OpenMP::OpenMP_CXX
+    GDAL::GDAL
 )
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(satellite_dataset_tests
+        tests/satellite_dataset_test.cpp
+        src/satellite_dataset.cpp
+    )
+    target_include_directories(satellite_dataset_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${OpenCV_INCLUDE_DIRS}
+    )
+    target_link_libraries(satellite_dataset_tests PRIVATE
+        ${OpenCV_LIBS}
+        GDAL::GDAL
+    )
+    add_test(NAME satellite_dataset_tests COMMAND satellite_dataset_tests)
+endif()
 
 if(USE_CUDA)
     target_link_libraries(parallel_pipeline PRIVATE CUDA::cudart)

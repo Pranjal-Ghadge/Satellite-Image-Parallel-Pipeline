@@ -26,7 +26,7 @@ DATA_INPUT_DIR.mkdir(parents=True, exist_ok=True)
 DATA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 (PROJECT_DIR / "docs").mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(title="Satellite Image Parallel Pipeline API")
+app = FastAPI(title="AAKASHNETRA : The Eye in the Sky")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,7 +38,7 @@ app.add_middleware(
 
 class PipelineRequest(BaseModel):
     input_filename: Optional[str] = None
-    resolution: str = Field(default="1024x1024", pattern=r"^(512x512|1024x1024|4096x4096)$")
+    resolution: str = Field(default="1024x1024", pattern=r"^(512x512|1024x1024|2048x2048|4096x4096)$")
     threads: int = Field(default=8, ge=1, le=64)
     enable_cuda: bool = False
     gaussian_kernel: int = Field(default=5, ge=3, le=7)
@@ -61,7 +61,7 @@ def cuda_build_is_enabled() -> bool:
 
 
 def calculate_speedups_from_stdout(stdout: str) -> dict:
-    """Parse runtime blocks emitted by utils.cpp and calculate Sp values."""
+    """Parse runtime blocks emitted by utils.cpp and calculate Sp and Ep values."""
     runtimes = {}
     pattern = re.compile(
         r"Execution Mode:\s*(.*?)\s*Resolution:\s*(.*?)\s*Runtime:\s*([\d.]+)\s*ms",
@@ -83,14 +83,24 @@ def calculate_speedups_from_stdout(stdout: str) -> dict:
         None,
     )
     speedups = {"sequential": 1.0 if baseline else 0.0}
+    efficiencies = {"sequential": 100.0 if baseline else 0.0}
     if baseline and baseline > 0:
         for mode, runtime in runtimes.items():
             if runtime > 0:
-                speedups[mode.lower()] = round(baseline / runtime, 2)
+                sp = round(baseline / runtime, 2)
+                mode_key = mode.lower()
+                speedups[mode_key] = sp
+                # Extract thread count if available for parallel efficiency
+                match = re.search(r"(\d+)\s*threads?", mode, re.IGNORECASE)
+                threads = int(match.group(1)) if match else 1
+                if threads > 0:
+                    efficiencies[mode_key] = round((sp / threads) * 100.0, 1)
+
     return {
         "runtimes_ms": runtimes,
         "baseline_time_ms": baseline,
         "speedups": speedups,
+        "efficiencies": efficiencies,
     }
 
 
@@ -147,19 +157,22 @@ def run_pipeline(request: PipelineRequest):
     if len(width_height) != 2:
         raise HTTPException(status_code=400, detail="Invalid resolution.")
 
-    prepared_path = DATA_INPUT_DIR / f"prepared_{input_path.stem}_{width_height[0]}x{width_height[1]}{input_path.suffix.lower()}"
+    prepared_path = DATA_INPUT_DIR / f"prepared_{input_path.stem}_{width_height[0]}x{width_height[1]}.jpg"
     try:
         with Image.open(input_path) as image:
+            # Flatten transparency for RGBA/P images
+            if image.mode in ("RGBA", "LA", "P"):
+                image = image.convert("RGB")
             grayscale = ImageOps.grayscale(image)
+            # Satellite optical radiometric percentile calibration (2% to 98% dynamic range stretch)
+            # Penetrates atmospheric Rayleigh haze and boosts geological, coastline, and road contrast
+            calibrated = ImageOps.autocontrast(grayscale, cutoff=2)
             resized = ImageOps.fit(
-                grayscale,
+                calibrated,
                 (int(width_height[0]), int(width_height[1])),
                 method=Image.Resampling.LANCZOS,
             )
-            if prepared_path.suffix.lower() in {".jpg", ".jpeg"}:
-                resized.save(prepared_path, format="JPEG")
-            else:
-                resized.save(prepared_path)
+            resized.save(prepared_path, format="JPEG", quality=95)
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Unable to prepare the uploaded image.") from exc
 
@@ -229,7 +242,7 @@ def run_pipeline(request: PipelineRequest):
     return {
         "success": True,
         "input": f"/input/{input_path.name}",
-        "prepared_input": f"/input/{prepared_path.name}",
+        "prepared_input": f"/input/{prepared_path.name}?v={uuid.uuid4().hex}",
         "resolution": request.resolution,
         "threads": request.threads,
         "cuda_requested": request.enable_cuda,
@@ -246,6 +259,7 @@ def run_pipeline(request: PipelineRequest):
         "baseline_time_ms": performance["baseline_time_ms"],
         "runtimes_ms": performance["runtimes_ms"],
         "speedups": normalized_speedups,
+        "efficiencies": performance.get("efficiencies", {}),
         "speedup": {
             "sequential": normalized_speedups.get("sequential", 1.0),
             "openmp": next(
@@ -261,7 +275,33 @@ def run_pipeline(request: PipelineRequest):
                 1.0 if cuda_image_url else None,
             ),
         },
+        "efficiency": {
+            "sequential": 100.0,
+            "openmp": next(
+                (
+                    value
+                    for mode, value in performance.get("efficiencies", {}).items()
+                    if "openmp" in mode
+                ),
+                None,
+            ),
+        },
     }
+
+
+@app.get("/api/satellite-samples")
+def list_satellite_samples():
+    sample_dir = PROJECT_DIR / "data" / "satellite_samples"
+    samples = []
+    if sample_dir.exists():
+        for f in sample_dir.glob("*.jpg"):
+            name = f.stem.replace("_", " ").title()
+            samples.append({
+                "name": name,
+                "filename": f.name,
+                "url": f"/input/{f.name}",
+            })
+    return {"samples": samples}
 
 
 @app.get("/api/benchmark-results")
@@ -293,6 +333,12 @@ def benchmark_results():
                     if baseline and baseline > 0 and execution_ms > 0
                     else 1.0 if "Sequential" in mode else None
                 )
+                efficiency = None
+                if len(row) >= 6:
+                    try:
+                        efficiency = float(row[5])
+                    except ValueError:
+                        pass
                 results.append(
                     {
                         "mode": mode.strip(),
@@ -300,12 +346,20 @@ def benchmark_results():
                         "execution_time_ms": execution_ms,
                         "throughput_mpps": throughput_mpps,
                         "speedup": speedup,
+                        "parallel_efficiency": efficiency,
                     }
                 )
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Unable to read benchmark results: {exc}") from exc
 
     return {"results": results}
+
+
+@app.post("/api/clear-benchmarks")
+def clear_benchmarks():
+    if BENCHMARK_FILE.exists():
+        BENCHMARK_FILE.unlink()
+    return {"success": True, "message": "Benchmark history cleared."}
 
 
 app.mount("/output", StaticFiles(directory=DATA_OUTPUT_DIR), name="output")

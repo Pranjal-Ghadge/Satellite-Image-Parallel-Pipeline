@@ -1,15 +1,69 @@
 #include <iostream>
 #include <cstdlib>
+#include <exception>
+#include <limits>
+#include <string>
 #include <vector>
 #include <opencv2/opencv.hpp>
 #include "utils.h"
 #include "cpu_sequential.h"
 #include "cpu_openmp.h"
+#include "satellite_dataset.h"
 #ifdef USE_CUDA
 #include "gpu_cuda.h"
 #endif
 
+namespace {
+
+int validate_pair_command(int argc, char** argv) {
+    if (argc != 4 && argc != 6) {
+        std::cerr << "Usage: parallel_pipeline --validate-pair <pre-flood.tif> "
+                     "<post-flood.tif> [--band <one-based-index>]\n";
+        return 2;
+    }
+
+    int band_index = 1;
+    if (argc == 6) {
+        if (std::string(argv[4]) != "--band") {
+            std::cerr << "Expected --band before the band index.\n";
+            return 2;
+        }
+        char* end = nullptr;
+        const long parsed_band = std::strtol(argv[5], &end, 10);
+        if (end == argv[5] || *end != '\0' || parsed_band < 1 ||
+            parsed_band > std::numeric_limits<int>::max()) {
+            std::cerr << "Band index must be a positive integer.\n";
+            return 2;
+        }
+        band_index = static_cast<int>(parsed_band);
+    }
+
+    try {
+        const SatelliteImagePair pair =
+            load_aligned_sentinel1_pair(argv[2], argv[3], band_index);
+        std::cout << "Pre-flood GeoTIFF: " << pair.pre_flood.source_path << '\n'
+                  << "Post-flood GeoTIFF: " << pair.post_flood.source_path << '\n'
+                  << "Aligned dimensions: " << pair.pre_flood.pixels.cols << " x "
+                  << pair.pre_flood.pixels.rows << '\n'
+                  << "Band: " << band_index << " ("
+                  << pair.pre_flood.band_data_type << " / "
+                  << pair.post_flood.band_data_type << " source samples)\n"
+                  << "CRS and pixel geotransforms match; source geospatial metadata retained.\n";
+    } catch (const std::exception& error) {
+        std::cerr << "Satellite pair validation failed: " << error.what() << '\n';
+        return 1;
+    }
+
+    return 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--validate-pair") {
+        return validate_pair_command(argc, argv);
+    }
+
     std::string input_path = "data/raw/input_1024.jpg";
     std::vector<int> threads_to_test = {2, 4, 8, 16};
     int target_width = 0;
@@ -53,7 +107,8 @@ int main(int argc, char** argv) {
     Timer timer;
 
     std::cout << "\n==============================================" << std::endl;
-    std::cout << " Starting Parallel Satellite Pipeline Benchmark" << std::endl;
+    std::cout << " AAKASHNETRA : The Eye in the Sky" << std::endl;
+    std::cout << " Parallel Satellite Image Pipeline Benchmark" << std::endl;
     std::cout << "==============================================" << std::endl;
 
     // 1. Sequential CPU Execution

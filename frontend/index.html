@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Satellite Parallel Pipeline</title>
+    <title>AAKASHNETRA : The Eye in the Sky</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="/styles.css">
@@ -12,10 +12,10 @@
     <div class="ambient-grid"></div>
     <header class="app-header">
         <div class="brand-lockup">
-            <div class="brand-mark">SI</div>
+            <div class="brand-mark">AN</div>
             <div>
                 <p class="eyebrow">Satellite Image Processing</p>
-                <h1>High-Performance Parallel Pipeline for Real-Time Satellite Image Filtering</h1>
+                <h1>AAKASHNETRA : The Eye in the Sky</h1>
             </div>
         </div>
         <div class="status-pill"><span id="statusDot"></span><b id="systemStatus">System Ready</b></div>
@@ -30,21 +30,29 @@
                 <span>or click to browse</span>
             </div>
 
+            <div class="preset-bar">
+                <span class="preset-label">Authentic Satellite Scenes:</span>
+                <button type="button" class="preset-btn" data-file="landsat_coastal_shoreline.jpg">Landsat Coastal</button>
+                <button type="button" class="preset-btn" data-file="usgs_geological_terrain.jpg">USGS Geological</button>
+                <button type="button" class="preset-btn" data-file="satellite_urban_grid.jpg">Satellite Urban</button>
+            </div>
+
             <div class="control-grid">
                 <label>
                     Resolution
                     <select id="resolution">
                         <option value="512x512">512 × 512</option>
-                        <option value="1024x1024" selected>1024 × 1024</option>
-                        <option value="4096x4096">4096 × 4096</option>
+                        <option value="1024x1024" selected>1024 × 1024 (Standard Tile)</option>
+                        <option value="2048x2048">2048 × 2048 (Medium Scene)</option>
+                        <option value="4096x4096">4096 × 4096 (Full Orthoimage)</option>
                     </select>
                 </label>
                 <label>
                     OpenMP Threads
                     <select id="threads">
                         <option value="2">2 threads</option>
-                        <option value="4">4 threads</option>
-                        <option value="8" selected>8 threads</option>
+                        <option value="4" selected>4 threads</option>
+                        <option value="8">8 threads</option>
                         <option value="16">16 threads</option>
                     </select>
                 </label>
@@ -84,7 +92,12 @@
                 </article>
                 <article class="image-card glass-panel" data-view="openmp">
                     <div class="card-header"><span>OpenMP CPU</span><div class="meta-badges" id="openmpMeta"></div></div>
-                    <div class="image-frame"><img id="openmpImage" alt="OpenMP edge map"><span class="speedup-badge" id="openmpSpeedup">Awaiting run</span><span class="placeholder">Awaiting run</span></div>
+                    <div class="image-frame">
+                        <img id="openmpImage" alt="OpenMP edge map">
+                        <span class="speedup-badge" id="openmpSpeedup">Awaiting run</span>
+                        <span class="efficiency-badge" id="openmpEfficiency"></span>
+                        <span class="placeholder">Awaiting run</span>
+                    </div>
                     <a id="downloadOpenmp" class="download" hidden download>Download</a>
                 </article>
                 <article class="image-card glass-panel" data-view="cuda">
@@ -116,16 +129,41 @@
         <section>
             <div class="section-heading">
                 <div><p class="eyebrow">Performance</p><h2>Benchmark Analytics</h2></div>
+                <button id="clearHistoryBtn" type="button" class="secondary-button" style="padding: 5px 12px; font-size: 12px;">Clear History</button>
             </div>
             <div class="metric-grid">
-                <article class="glass-panel"><span>Peak Speedup Achieved</span><strong id="peakCpu">—</strong><small>S<sub>p</sub> against sequential baseline</small></article>
-                <article class="glass-panel"><span>GPU Acceleration</span><strong id="gpuTime">—</strong><small>GPU throughput MP/s</small></article>
-                <article class="glass-panel"><span>Total Time Savings</span><strong id="totalSavings">—</strong><small>versus sequential baseline</small></article>
+                <article class="glass-panel"><span>Peak Speedup (S<sub>p</sub>)</span><strong id="peakCpu">—</strong><small>versus sequential baseline</small></article>
+                <article class="glass-panel"><span>Parallel Efficiency (E<sub>p</sub>)</span><strong id="parallelEfficiency">—</strong><small>E<sub>p</sub> = S<sub>p</sub> / cores</small></article>
+                <article class="glass-panel"><span>Peak Throughput</span><strong id="peakThroughput">—</strong><small>Megapixels / second</small></article>
+                <article class="glass-panel"><span>Time Saved</span><strong id="totalSavings">—</strong><small>versus sequential baseline</small></article>
             </div>
             <div class="chart-grid">
                 <article class="chart-card glass-panel"><h3>Execution Latency</h3><canvas id="timeChart"></canvas></article>
                 <article class="chart-card glass-panel"><h3>Throughput Scaling</h3><canvas id="throughputChart"></canvas></article>
             </div>
+            <article class="table-card glass-panel" style="margin-top: 14px; padding: 18px; border-radius: 14px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                    <h3 style="margin: 0; font-size: 15px; font-weight: 700; color: #f8fafc;">Benchmark Performance Metrics Table</h3>
+                    <span id="tableResolutionBadge" style="font-size: 12px; color: #38bdf8; font-weight: 600;">Resolution: 1024×1024</span>
+                </div>
+                <div style="overflow-x: auto;">
+                    <table class="benchmark-table">
+                        <thead>
+                            <tr>
+                                <th>Execution Mode</th>
+                                <th>Resolution</th>
+                                <th>Runtime (Tp)</th>
+                                <th>Speedup (Sp)</th>
+                                <th>Parallel Efficiency (Ep)</th>
+                                <th>Throughput</th>
+                            </tr>
+                        </thead>
+                        <tbody id="benchmarkTableBody">
+                            <tr><td colspan="6" style="text-align: center; color: #94a3b8; padding: 20px;">No benchmark data recorded.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </article>
         </section>
     </main>
 

@@ -66,6 +66,17 @@ function setSpeedupBadge(id, speedup, unavailableText = "Awaiting run") {
     badge.textContent = `${Number(speedup).toFixed(2)}x Speedup`;
 }
 
+function setEfficiencyBadge(id, efficiency) {
+    const badge = document.querySelector(id);
+    if (!badge) return;
+    if (efficiency === null || efficiency === undefined) {
+        badge.style.display = "none";
+        return;
+    }
+    badge.style.display = "block";
+    badge.textContent = `Ep: ${Number(efficiency).toFixed(1)}%`;
+}
+
 async function updateMetadata(elementId, metaId, url) {
     const image = document.querySelector(elementId);
     const meta = document.querySelector(metaId);
@@ -132,11 +143,26 @@ async function uploadFile(file) {
 }
 
 elements.uploadZone.addEventListener("click", () => elements.imageInput.click());
-elements.imageInput.addEventListener("change", () => uploadFile(elements.imageInput.files[0]));
+elements.imageInput.addEventListener("change", () => {
+    if (elements.imageInput.files && elements.imageInput.files[0]) {
+        uploadFile(elements.imageInput.files[0]);
+        elements.imageInput.value = "";
+    }
+});
 ["dragenter", "dragover"].forEach(type => elements.uploadZone.addEventListener(type, event => {
     event.preventDefault();
     elements.uploadZone.classList.add("dragging");
 }));
+
+document.querySelectorAll(".preset-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+        const filename = btn.getAttribute("data-file");
+        state.uploadedFilename = filename;
+        setImage("#inputImage", "#downloadInput", "#inputMeta", `/input/${filename}?t=${Date.now()}`, filename);
+        showToast(`Loaded satellite scene: ${btn.textContent}`);
+        appendTerminal(`Selected satellite scene: ${btn.textContent} (${filename})`);
+    });
+});
 ["dragleave", "drop"].forEach(type => elements.uploadZone.addEventListener(type, event => {
     event.preventDefault();
     elements.uploadZone.classList.remove("dragging");
@@ -310,6 +336,7 @@ elements.runButton.addEventListener("click", async () => {
         setImage("#openmpImage", "#downloadOpenmp", "#openmpMeta", data.outputs.openmp, "openmp_edge.jpg");
         document.querySelector("#sequentialSpeedup").textContent = "1.00x (Baseline)";
         setSpeedupBadge("#openmpSpeedup", data.speedup?.openmp);
+        setEfficiencyBadge("#openmpEfficiency", data.efficiency?.openmp);
 
         const cudaImage = document.querySelector("#cuda-img");
         const cudaPlaceholder = document.querySelector("#cudaPlaceholder");
@@ -365,18 +392,19 @@ function chartDefaults() {
 const speedupDataLabelPlugin = {
     id: "speedupDataLabels",
     afterDatasetsDraw(chart) {
+        if (!chart.data?.labels || chart.data.labels.length > 8) return;
         const { ctx } = chart;
         ctx.save();
         ctx.font = "700 11px Inter, Segoe UI, sans-serif";
         ctx.textAlign = "center";
-        ctx.fillStyle = "#ecfeff";
+        ctx.fillStyle = "#38bdf8";
         chart.data.datasets.forEach((dataset, datasetIndex) => {
             const meta = chart.getDatasetMeta(datasetIndex);
             meta.data.forEach((element, index) => {
                 const speedup = chart.data.speedups?.[index];
                 if (!speedup) return;
                 const position = element.tooltipPosition();
-                ctx.fillText(`Sp ${Number(speedup).toFixed(2)}x`, position.x, position.y - 9);
+                ctx.fillText(`Sp ${Number(speedup).toFixed(2)}x`, position.x, Math.max(16, position.y - 8));
             });
         });
         ctx.restore();
@@ -393,9 +421,25 @@ async function loadBenchmarks() {
         if (!results.length) return;
 
         const latestResolution = results[results.length - 1]?.resolution;
-        const latest = results.filter(row => row.resolution === latestResolution);
+        const matchingRes = results.filter(row => row.resolution === latestResolution);
+
+        // Keep only the most recent run per distinct execution mode
+        const modeMap = new Map();
+        for (const row of matchingRes) {
+            modeMap.set(row.mode.trim(), row);
+        }
+        const latest = Array.from(modeMap.values());
         const cpuResults = latest.filter(row => !row.mode.includes("CUDA"));
-        const labels = cpuResults.map(row => row.mode.replace("CPU ", "").replace("Baseline", "Sequential"));
+
+        const cleanLabel = mode => {
+            if (mode.includes("Sequential")) return "Sequential (T1)";
+            const m = mode.match(/(\d+)\s*Threads?/i);
+            if (m) return `OpenMP (${m[1]}T)`;
+            if (mode.includes("CUDA")) return "CUDA (GPU)";
+            return mode.replace("CPU ", "");
+        };
+
+        const labels = cpuResults.map(row => cleanLabel(row.mode));
         const times = cpuResults.map(row => row.execution_time_ms);
         const throughput = cpuResults.map(row => row.throughput_mpps);
         const gpu = latest.find(row => row.mode.includes("CUDA"));
@@ -413,45 +457,173 @@ async function loadBenchmarks() {
                 : (sequential && row.execution_time_ms > 0 ? Math.round((sequential / row.execution_time_ms) * 100) / 100 : 1)
         );
 
+        const peakThroughputVal = Math.max(...throughput, 0);
+        const peakEfficiency = Math.max(...cpuResults.map(r => r.parallel_efficiency || 0).filter(Boolean), 0);
+
         document.querySelector("#peakCpu").textContent = `${peakAchieved.toFixed(2)}x`;
-        document.querySelector("#gpuTime").textContent = gpu ? `${gpu.throughput_mpps.toFixed(1)} MP/s` : "—";
+        if (document.querySelector("#parallelEfficiency")) {
+            document.querySelector("#parallelEfficiency").textContent = peakEfficiency > 0 ? `${peakEfficiency.toFixed(1)}%` : "—";
+        }
+        if (document.querySelector("#peakThroughput")) {
+            document.querySelector("#peakThroughput").textContent = peakThroughputVal > 0 ? `${peakThroughputVal.toFixed(1)} MP/s` : "—";
+        }
         document.querySelector("#totalSavings").textContent = `${Math.max(0, savings).toFixed(1)}%`;
         document.querySelector("#sequentialSpeedup").textContent = "1.00x (Baseline)";
         const openmpLatest = [...cpuResults].reverse().find(row => row.mode.includes("OpenMP"));
         if (openmpLatest?.speedup) {
             setSpeedupBadge("#openmpSpeedup", openmpLatest.speedup);
         }
+        if (openmpLatest?.parallel_efficiency) {
+            setEfficiencyBadge("#openmpEfficiency", openmpLatest.parallel_efficiency);
+        }
+
+        // Populate the Benchmark Performance Metrics Table
+        const tableBody = document.querySelector("#benchmarkTableBody");
+        const resBadge = document.querySelector("#tableResolutionBadge");
+        if (resBadge) resBadge.textContent = `Resolution: ${latestResolution}`;
+        if (tableBody) {
+            tableBody.innerHTML = latest.map(row => {
+                const isSeq = row.mode.includes("Sequential");
+                const spTag = isSeq
+                    ? `<span class="badge-tag baseline">1.00x Baseline</span>`
+                    : `<span class="badge-tag speedup">${Number(row.speedup || 1).toFixed(2)}x Speedup</span>`;
+                const epTag = row.parallel_efficiency
+                    ? `<span class="badge-tag efficiency">${Number(row.parallel_efficiency).toFixed(1)}% Ep</span>`
+                    : (isSeq ? `<span class="badge-tag baseline">100.0% Ep</span>` : `—`);
+                
+                return `
+                    <tr>
+                        <td style="font-weight: 600; color: #f8fafc;">${cleanLabel(row.mode)}</td>
+                        <td style="color: #94a3b8;">${row.resolution}</td>
+                        <td style="font-weight: 700; color: #38bdf8;">${Number(row.execution_time_ms).toFixed(2)} ms</td>
+                        <td>${spTag}</td>
+                        <td>${epTag}</td>
+                        <td style="color: #34d399; font-weight: 600;">${Number(row.throughput_mpps).toFixed(1)} MP/s</td>
+                    </tr>
+                `;
+            }).join("");
+        }
+
+        const barColors = [
+            "rgba(59, 130, 246, 0.9)",   // Blue
+            "rgba(16, 185, 129, 0.9)",  // Emerald
+            "rgba(168, 85, 247, 0.9)",  // Purple
+            "rgba(245, 158, 11, 0.9)",  // Amber
+            "rgba(14, 165, 233, 0.9)",  // Cyan
+        ];
 
         if (!charts.time) {
             charts.time = new Chart(document.querySelector("#timeChart"), {
                 type: "bar",
-                data: { labels, speedups, datasets: [{ label: "Execution Time (ms)", data: times, backgroundColor: ["rgba(34,211,238,.85)", "rgba(96,165,250,.85)", "rgba(129,140,248,.85)", "rgba(167,139,250,.85)", "rgba(52,211,153,.85)"], borderRadius: 7, borderSkipped: false }] },
-                plugins: [speedupDataLabelPlugin],
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false }, tooltip: { callbacks: { label: context => `${context.formattedValue} ms · Sp ${Number(speedups[context.dataIndex] || 1).toFixed(2)}x` } } }, scales: { y: { beginAtZero: true, title: { display: true, text: "milliseconds" } }, x: { grid: { display: false } } } }
+                data: {
+                    labels,
+                    speedups,
+                    datasets: [{
+                        label: "Execution Latency (ms)",
+                        data: times,
+                        backgroundColor: barColors.slice(0, labels.length),
+                        borderRadius: 8,
+                        maxBarThickness: 36,
+                    }]
+                },
+                options: {
+                    indexAxis: "y",
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: "rgba(15, 23, 42, 0.95)",
+                            titleColor: "#f8fafc",
+                            bodyColor: "#38bdf8",
+                            borderColor: "#334155",
+                            borderWidth: 1,
+                            padding: 12,
+                            titleFont: { size: 13, weight: "bold" },
+                            bodyFont: { size: 12 },
+                            callbacks: {
+                                label: context => `${context.formattedValue} ms · Speedup: ${Number(speedups[context.dataIndex] || 1).toFixed(2)}x`
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            beginAtZero: true,
+                            title: { display: true, text: "Latency in ms (Lower is Faster)", color: "#94a3b8", font: { size: 12 } },
+                            ticks: { color: "#cbd5e1", font: { size: 12 } },
+                            grid: { color: "rgba(148, 163, 184, 0.1)" }
+                        },
+                        y: {
+                            ticks: { color: "#f8fafc", font: { size: 13, weight: "600" } },
+                            grid: { display: false }
+                        }
+                    }
+                }
             });
         } else {
             charts.time.data.labels = labels;
             charts.time.data.speedups = speedups;
             charts.time.data.datasets[0].data = times;
+            charts.time.data.datasets[0].backgroundColor = barColors.slice(0, labels.length);
             charts.time.update();
         }
 
         const threadLabels = cpuResults.map(row => {
             const match = row.mode.match(/(\d+)\s+Threads?/);
-            return match ? `${match[1]}T` : "1T";
+            return match ? `${match[1]} Threads` : "1 Thread";
         });
         if (!charts.throughput) {
             charts.throughput = new Chart(document.querySelector("#throughputChart"), {
                 type: "line",
-                data: { labels: threadLabels, speedups, datasets: [{ label: "CPU Throughput (MP/s)", data: throughput, borderColor: "#22d3ee", backgroundColor: "rgba(34,211,238,.12)", fill: true, tension: .35, pointRadius: 5, pointBackgroundColor: "#22d3ee" }, ...(gpu ? [{ label: "CUDA GPU", data: threadLabels.map((_, index) => index === threadLabels.length - 1 ? gpu.throughput_mpps : null), borderColor: "#a78bfa", backgroundColor: "rgba(167,139,250,.12)", pointBackgroundColor: "#a78bfa", spanGaps: false }] : [])] },
-                plugins: [speedupDataLabelPlugin],
-                options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { labels: { boxWidth: 10 } } }, scales: { y: { beginAtZero: true, title: { display: true, text: "Megapixels/sec" } }, x: { title: { display: true, text: "Thread configuration" }, grid: { display: false } } } }
+                data: {
+                    labels: threadLabels,
+                    datasets: [{
+                        label: "CPU Throughput (MP/s)",
+                        data: throughput,
+                        borderColor: "#10b981",
+                        backgroundColor: "rgba(16, 185, 129, 0.12)",
+                        fill: true,
+                        tension: 0.35,
+                        pointRadius: 6,
+                        pointBackgroundColor: "#10b981",
+                        pointBorderColor: "#ffffff",
+                        pointBorderWidth: 2,
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            backgroundColor: "rgba(15, 23, 42, 0.95)",
+                            titleColor: "#f8fafc",
+                            bodyColor: "#34d399",
+                            borderColor: "#334155",
+                            borderWidth: 1,
+                            padding: 12,
+                            callbacks: {
+                                label: context => `${context.formattedValue} MP/s`
+                            }
+                        }
+                    },
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            title: { display: true, text: "Throughput (MP/s)", color: "#94a3b8", font: { size: 12 } },
+                            ticks: { color: "#cbd5e1", font: { size: 12 } },
+                            grid: { color: "rgba(148, 163, 184, 0.1)" }
+                        },
+                        x: {
+                            ticks: { color: "#f8fafc", font: { size: 13, weight: "600" } },
+                            grid: { display: false }
+                        }
+                    }
+                }
             });
         } else {
             charts.throughput.data.labels = threadLabels;
-            charts.throughput.data.speedups = speedups;
             charts.throughput.data.datasets[0].data = throughput;
-            if (charts.throughput.data.datasets[1]) charts.throughput.data.datasets[1].data = threadLabels.map((_, index) => index === threadLabels.length - 1 && gpu ? gpu.throughput_mpps : null);
             charts.throughput.update();
         }
     } catch (_) {
@@ -460,4 +632,22 @@ async function loadBenchmarks() {
 }
 
 window.addEventListener("resize", () => updateSplit());
+document.querySelector("#clearHistoryBtn")?.addEventListener("click", async () => {
+    try {
+        await fetch("/api/clear-benchmarks", { method: "POST" });
+        showToast("Benchmark history cleared.");
+        appendTerminal("Benchmark history reset for clean evaluation.", "[OK]");
+        if (charts.time) {
+            charts.time.destroy();
+            charts.time = null;
+        }
+        if (charts.throughput) {
+            charts.throughput.destroy();
+            charts.throughput = null;
+        }
+        await loadBenchmarks();
+    } catch (_) {
+        showToast("Unable to clear history.");
+    }
+});
 loadBenchmarks();
