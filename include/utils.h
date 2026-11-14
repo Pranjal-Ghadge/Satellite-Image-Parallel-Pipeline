@@ -22,5 +22,11 @@ public:
 };
 
 void log_performance(const std::string& mode, int width, int height, double execution_time_ms, double baseline_time_ms = 0.0);
+bool load_image_pair(
+    const std::string& pre_path,
+    const std::string& post_path,
+    cv::Mat& pre_intensity,
+    cv::Mat& post_intensity,
+    std::string& error);
 
 #endif

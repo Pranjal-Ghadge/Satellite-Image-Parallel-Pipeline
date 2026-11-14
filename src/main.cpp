@@ -1,6 +1,9 @@
 #include <iostream>
 #include <cstdlib>
+#include <exception>
+#include <limits>
 #include <vector>
+#include <string>
 #include <opencv2/opencv.hpp>
 #include "utils.h"
 #include "cpu_sequential.h"
@@ -9,28 +12,124 @@
 #include "gpu_cuda.h"
 #endif
 
+namespace {
+
+void print_usage(const char* executable) {
+    std::cout
+        << "Usage:\n"
+        << "  " << executable << " [image_path] [--threads N] [--resolution WIDTHxHEIGHT]\n"
+        << "  " << executable << " --pre <path> --post <path> [--threads N]\n"
+        << "  " << executable << " --help\n\n"
+        << "Legacy single-image mode runs the Gaussian+Sobel benchmark.\n"
+        << "Paired-image mode validates and converts both images to single-channel CV_32F; "
+           "flood detection is not yet implemented.\n"
+        << "Options:\n"
+        << "  --pre <path>                 Pre-flood image (requires --post)\n"
+        << "  --post <path>                Post-flood image (requires --pre)\n"
+        << "  --threads N                  OpenMP thread count (legacy benchmark)\n"
+        << "  --resolution WIDTHxHEIGHT    Resize legacy single-image input\n"
+        << "  --help                       Show this help\n";
+}
+
+bool parse_positive_integer(const std::string& value, int& result) {
+    try {
+        size_t parsed = 0;
+        const long parsed_value = std::stol(value, &parsed);
+        if (parsed != value.size() || parsed_value <= 0 ||
+            parsed_value > std::numeric_limits<int>::max()) {
+            return false;
+        }
+        result = static_cast<int>(parsed_value);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+}
+
 int main(int argc, char** argv) {
     std::string input_path = "data/raw/input_1024.jpg";
+    std::string pre_path;
+    std::string post_path;
     std::vector<int> threads_to_test = {2, 4, 8, 16};
     int target_width = 0;
     int target_height = 0;
+    bool has_positional_input = false;
 
-    if (argc > 1) input_path = argv[1];
-    for (int i = 2; i < argc; ++i) {
+    for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "--threads" && i + 1 < argc) {
-            int requested_threads = std::atoi(argv[++i]);
-            if (requested_threads > 0) {
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return 0;
+        } else if (arg == "--pre" || arg == "--post" || arg == "--threads" || arg == "--resolution") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: Missing value for " << arg << ".\n";
+                print_usage(argv[0]);
+                return 2;
+            }
+
+            const std::string value = argv[++i];
+            if (arg == "--pre") {
+                pre_path = value;
+            } else if (arg == "--post") {
+                post_path = value;
+            } else if (arg == "--threads") {
+                int requested_threads = 0;
+                if (!parse_positive_integer(value, requested_threads)) {
+                    std::cerr << "Error: --threads must be a positive integer.\n";
+                    return 2;
+                }
                 threads_to_test = {requested_threads};
+            } else {
+                const size_t separator = value.find('x');
+                if (separator == std::string::npos ||
+                    !parse_positive_integer(value.substr(0, separator), target_width) ||
+                    !parse_positive_integer(value.substr(separator + 1), target_height)) {
+                    std::cerr << "Error: --resolution must be WIDTHxHEIGHT with positive dimensions.\n";
+                    return 2;
+                }
             }
-        } else if (arg == "--resolution" && i + 1 < argc) {
-            std::string resolution = argv[++i];
-            size_t separator = resolution.find('x');
-            if (separator != std::string::npos) {
-                target_width = std::atoi(resolution.substr(0, separator).c_str());
-                target_height = std::atoi(resolution.substr(separator + 1).c_str());
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Error: Unknown option " << arg << ".\n";
+            print_usage(argv[0]);
+            return 2;
+        } else {
+            if (has_positional_input) {
+                std::cerr << "Error: Only one positional image path is supported.\n";
+                print_usage(argv[0]);
+                return 2;
             }
+            input_path = arg;
+            has_positional_input = true;
         }
+    }
+
+    const bool has_pre_path = !pre_path.empty();
+    const bool has_post_path = !post_path.empty();
+    if (has_pre_path != has_post_path) {
+        std::cerr << "Error: --pre and --post must be provided together.\n";
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (has_pre_path && has_positional_input) {
+        std::cerr << "Error: Use either a positional image path or --pre/--post, not both.\n";
+        return 2;
+    }
+
+    if (has_pre_path) {
+        cv::Mat pre_intensity;
+        cv::Mat post_intensity;
+        std::string error;
+        if (!load_image_pair(pre_path, post_path, pre_intensity, post_intensity, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+
+        std::cout << "Validated pre-/post-flood image pair: "
+                  << pre_intensity.cols << "x" << pre_intensity.rows
+                  << " pixels; both converted to single-channel CV_32F intensity.\n";
+        return 0;
     }
 
     cv::Mat input = cv::imread(input_path, cv::IMREAD_GRAYSCALE);
