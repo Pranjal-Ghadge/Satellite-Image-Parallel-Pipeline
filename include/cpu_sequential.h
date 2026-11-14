@@ -14,5 +14,9 @@ void detect_flood_change_sequential(
     const cv::Mat& post_water_mask,
     cv::Mat& new_flood_mask,
     cv::Mat& semantic_map);
+void cleanup_flood_sequential(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels);
 
 #endif

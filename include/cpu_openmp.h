@@ -16,5 +16,10 @@ void detect_flood_change_openmp(
     cv::Mat& new_flood_mask,
     cv::Mat& semantic_map,
     int num_threads);
+void cleanup_flood_openmp(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels,
+    int num_threads);
 
 #endif

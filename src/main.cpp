@@ -27,11 +27,12 @@ void print_usage(const char* executable) {
            "[--pixel-size meters] [--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --pre <path> --post <path> [--threads N] "
            "[--threshold value | --auto-threshold] "
-           "[--pixel-size meters] [--origin-lat deg --origin-lon deg]\n"
+           "[--min-patch-pixels N] [--pixel-size meters] "
+           "[--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --help\n\n"
         << "Legacy single-image mode runs the Gaussian+Sobel benchmark.\n"
-        << "Paired-image mode normalizes and despeckles both images, then writes pre/post "
-           "binary water masks.\n"
+        << "Paired-image mode normalizes and despeckles both images, segments water, "
+           "detects and cleans flood zones, and writes binary and semantic maps.\n"
         << "Options:\n"
         << "  --pre <path>                 Pre-flood image (requires --post)\n"
         << "  --post <path>                Post-flood image (requires --pre)\n"
@@ -39,6 +40,7 @@ void print_usage(const char* executable) {
         << "  --resolution WIDTHxHEIGHT    Resize legacy single-image input\n"
         << "  --threshold value            Manual dark-water threshold on [0, 1] (default 0.25)\n"
         << "  --auto-threshold             Compute an Otsu threshold independently per image\n"
+        << "  --min-patch-pixels N         Minimum retained flood patch area (default 25)\n"
         << "  --pixel-size meters          Pixel size fallback/override in meters (default 10.0)\n"
         << "  --origin-lat deg             Optional origin latitude (-90 to 90)\n"
         << "  --origin-lon deg             Optional origin longitude (-180 to 180)\n"
@@ -117,6 +119,8 @@ int main(int argc, char** argv) {
     float water_threshold = 0.25f;
     bool threshold_overridden = false;
     bool auto_threshold = false;
+    int minimum_patch_pixels = 25;
+    bool minimum_patch_overridden = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -128,7 +132,7 @@ int main(int argc, char** argv) {
         } else if (arg == "--pre" || arg == "--post" || arg == "--threads" ||
             arg == "--resolution" || arg == "--pixel-size" ||
             arg == "--origin-lat" || arg == "--origin-lon" ||
-            arg == "--threshold") {
+            arg == "--threshold" || arg == "--min-patch-pixels") {
             if (i + 1 >= argc) {
                 std::cerr << "Error: Missing value for " << arg << ".\n";
                 print_usage(argv[0]);
@@ -171,6 +175,12 @@ int main(int argc, char** argv) {
                 }
                 water_threshold = static_cast<float>(parsed_threshold);
                 threshold_overridden = true;
+            } else if (arg == "--min-patch-pixels") {
+                if (!parse_positive_integer(value, minimum_patch_pixels)) {
+                    std::cerr << "Error: --min-patch-pixels must be a positive integer.\n";
+                    return 2;
+                }
+                minimum_patch_overridden = true;
             } else if (arg == "--origin-lat") {
                 if (!parse_finite_double(value, origin_lat_deg) ||
                     origin_lat_deg < -90.0 || origin_lat_deg > 90.0) {
@@ -208,8 +218,9 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 2;
     }
-    if (!has_pre_path && (threshold_overridden || auto_threshold)) {
-        std::cerr << "Error: Water threshold options require paired-image mode (--pre/--post).\n";
+    if (!has_pre_path &&
+        (threshold_overridden || auto_threshold || minimum_patch_overridden)) {
+        std::cerr << "Error: Water threshold and patch options require paired-image mode (--pre/--post).\n";
         return 2;
     }
     if (has_pre_path && has_positional_input) {
@@ -297,6 +308,14 @@ int main(int argc, char** argv) {
         cv::Mat semantic_map;
         detect_flood_change_sequential(
             pre_water_mask, post_water_mask, new_flood_mask, semantic_map);
+        Timer cleanup_timer;
+        cleanup_timer.start();
+        cleanup_flood_sequential(
+            new_flood_mask, semantic_map, minimum_patch_pixels);
+        const double sequential_cleanup_ms = cleanup_timer.stop_ms();
+        std::cout << "Sequential morphology + connected-component cleanup: "
+                  << sequential_cleanup_ms << " ms (minimum patch: "
+                  << minimum_patch_pixels << " pixels).\n";
 
         cv::Mat pre_openmp;
         cv::Mat post_openmp;
@@ -339,6 +358,14 @@ int main(int argc, char** argv) {
             detect_flood_change_openmp(
                 pre_openmp_mask, post_openmp_mask,
                 openmp_flood_mask, openmp_semantic_map, thread_count);
+            cleanup_timer.start();
+            cleanup_flood_openmp(
+                openmp_flood_mask, openmp_semantic_map,
+                minimum_patch_pixels, thread_count);
+            const double openmp_cleanup_ms = cleanup_timer.stop_ms();
+            std::cout << "OpenMP morphology + connected-component cleanup ("
+                      << thread_count << " threads): " << openmp_cleanup_ms
+                      << " ms.\n";
             if (cv::norm(new_flood_mask, openmp_flood_mask, cv::NORM_INF) != 0.0 ||
                 cv::norm(semantic_map, openmp_semantic_map, cv::NORM_INF) != 0.0) {
                 std::cerr << "Error: Sequential and OpenMP flood/class maps do not match exactly.\n";
@@ -387,6 +414,12 @@ int main(int argc, char** argv) {
             detect_flood_change_cuda(
                 pre_cuda_mask, post_cuda_mask,
                 cuda_flood_mask, cuda_semantic_map);
+            cleanup_timer.start();
+            cleanup_flood_cuda(
+                cuda_flood_mask, cuda_semantic_map, minimum_patch_pixels);
+            const double cuda_cleanup_ms = cleanup_timer.stop_ms();
+            std::cout << "CUDA morphology + connected-component cleanup: "
+                      << cuda_cleanup_ms << " ms.\n";
             if (cv::norm(new_flood_mask, cuda_flood_mask, cv::NORM_INF) != 0.0 ||
                 cv::norm(semantic_map, cuda_semantic_map, cv::NORM_INF) != 0.0) {
                 std::cerr << "Error: CUDA and sequential flood/class maps do not match exactly.\n";

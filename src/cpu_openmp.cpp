@@ -139,3 +139,15 @@ void detect_flood_change_openmp(
         }
     }
 }
+
+void cleanup_flood_openmp(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels,
+    int num_threads) {
+    if (num_threads <= 0) {
+        throw std::invalid_argument("OpenMP thread count must be positive");
+    }
+    cleanup_flood_classification(
+        flood_mask, semantic_map, minimum_patch_pixels);
+}

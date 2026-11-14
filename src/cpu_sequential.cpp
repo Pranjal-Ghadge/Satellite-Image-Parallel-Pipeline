@@ -122,3 +122,11 @@ void detect_flood_change_sequential(
         }
     }
 }
+
+void cleanup_flood_sequential(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels) {
+    cleanup_flood_classification(
+        flood_mask, semantic_map, minimum_patch_pixels);
+}

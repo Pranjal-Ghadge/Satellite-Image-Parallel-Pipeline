@@ -392,3 +392,11 @@ void detect_flood_change_cuda(
     check_cuda_result(cudaFree(device_flood), "cudaFree new-flood mask");
     check_cuda_result(cudaFree(device_semantic), "cudaFree semantic map");
 }
+
+void cleanup_flood_cuda(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels) {
+    cleanup_flood_classification(
+        flood_mask, semantic_map, minimum_patch_pixels);
+}

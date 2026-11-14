@@ -5,7 +5,9 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <opencv2/opencv.hpp>
+#include <vector>
 
 constexpr int kLeeWindowSize = 5;
 constexpr float kLeeEquivalentLooks = 4.0f;
@@ -129,6 +131,72 @@ inline bool is_binary_water_mask(const cv::Mat& mask) {
         }
     }
     return true;
+}
+
+inline void cleanup_flood_classification(
+    cv::Mat& flood_mask,
+    cv::Mat& semantic_map,
+    int minimum_patch_pixels) {
+    if (!is_binary_water_mask(flood_mask) ||
+        semantic_map.empty() || semantic_map.type() != CV_8UC1 ||
+        semantic_map.size() != flood_mask.size()) {
+        CV_Error(cv::Error::StsBadArg,
+            "Flood cleanup requires a binary CV_8UC1 mask and a matching CV_8UC1 semantic map");
+    }
+    if (minimum_patch_pixels <= 0) {
+        CV_Error(cv::Error::StsBadArg,
+            "Minimum flood patch area must be a positive number of pixels");
+    }
+
+    for (int y = 0; y < semantic_map.rows; ++y) {
+        const std::uint8_t* row = semantic_map.ptr<std::uint8_t>(y);
+        for (int x = 0; x < semantic_map.cols; ++x) {
+            if (row[x] > 3) {
+                CV_Error(cv::Error::StsBadArg,
+                    "Semantic map values must be between 0 and 3");
+            }
+        }
+    }
+
+    const cv::Mat original_flood_mask = flood_mask.clone();
+    cv::Mat cleaned;
+    const cv::Mat kernel = cv::getStructuringElement(
+        cv::MORPH_RECT, cv::Size(3, 3));
+    cv::morphologyEx(
+        original_flood_mask, cleaned, cv::MORPH_OPEN, kernel);
+    cv::morphologyEx(cleaned, cleaned, cv::MORPH_CLOSE, kernel);
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int component_count = cv::connectedComponentsWithStats(
+        cleaned, labels, stats, centroids, 8, CV_32S);
+
+    std::vector<std::uint8_t> keep_component(
+        static_cast<std::size_t>(component_count), 0);
+    for (int label = 1; label < component_count; ++label) {
+        if (stats.at<int>(label, cv::CC_STAT_AREA) >= minimum_patch_pixels) {
+            keep_component[static_cast<std::size_t>(label)] = 1;
+        }
+    }
+
+    for (int y = 0; y < flood_mask.rows; ++y) {
+        const int* label_row = labels.ptr<int>(y);
+        const std::uint8_t* original_row =
+            original_flood_mask.ptr<std::uint8_t>(y);
+        std::uint8_t* flood_row = flood_mask.ptr<std::uint8_t>(y);
+        std::uint8_t* semantic_row = semantic_map.ptr<std::uint8_t>(y);
+        for (int x = 0; x < flood_mask.cols; ++x) {
+            const bool retained =
+                keep_component[static_cast<std::size_t>(label_row[x])] != 0;
+            flood_row[x] = retained ? 255 : 0;
+            if (retained) {
+                semantic_row[x] = 2;
+            } else if (original_row[x] == 255 && semantic_row[x] == 2) {
+                semantic_row[x] = 0;
+            }
+        }
+    }
 }
 
 #endif
