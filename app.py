@@ -177,6 +177,14 @@ def run_pipeline(request: PipelineRequest):
         request.resolution,
     ]
     environment = os.environ.copy()
+    opencv_bin = r"C:\Users\HP\Downloads\opencv\build\x64\vc16\bin"
+    path_dirs = [str(PIPELINE_EXE.parent)]
+    if os.path.exists(opencv_bin):
+        path_dirs.append(opencv_bin)
+    if "PATH" in environment:
+        path_dirs.append(environment["PATH"])
+    environment["PATH"] = os.pathsep.join(path_dirs)
+
     environment["OMP_NUM_THREADS"] = str(request.threads)
     environment["PIPELINE_GAUSSIAN_KERNEL"] = str(request.gaussian_kernel)
     environment["PIPELINE_OMP_SCHEDULE"] = request.omp_schedule

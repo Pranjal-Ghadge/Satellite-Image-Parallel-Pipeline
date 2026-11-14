@@ -12,6 +12,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(NOT OpenCV_DIR AND EXISTS "C:/Users/HP/Downloads/opencv/build")
+    set(OpenCV_DIR "C:/Users/HP/Downloads/opencv/build")
+endif()
+
 find_package(OpenMP REQUIRED)
 find_package(OpenCV REQUIRED)
 

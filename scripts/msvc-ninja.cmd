@@ -11,13 +11,28 @@ if "%ENABLE_CUDA%"=="" set "ENABLE_CUDA=OFF"
 
 set "VS_PATH="
 
-:: Use quotes properly for vswhere command
+:: Try vswhere command
 for /f "usebackq tokens=*" %%i in (`^""%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath^"`) do (
     set "VS_PATH=%%i"
 )
 
+:: Fallback check known VS and BuildTools paths
 if not defined VS_PATH (
-    echo ERROR: Visual Studio installation not found.
+    if exist "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools" (
+        set "VS_PATH=C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Community" (
+        set "VS_PATH=C:\Program Files\Microsoft Visual Studio\2022\Community"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Professional" (
+        set "VS_PATH=C:\Program Files\Microsoft Visual Studio\2022\Professional"
+    ) else if exist "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" (
+        set "VS_PATH=C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+    ) else if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools" (
+        set "VS_PATH=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools"
+    )
+)
+
+if not defined VS_PATH (
+    echo ERROR: Visual Studio or Build Tools installation not found.
     exit /b 1
 )
 
@@ -29,16 +44,29 @@ if "%ENABLE_CUDA%"=="ON" (
 
 cd /d "%PROJECT_DIR%"
 
+set "TOOLCHAIN_FLAG="
+if exist "C:\vcpkg\scripts\buildsystems\vcpkg.cmake" (
+    set "TOOLCHAIN_FLAG=-DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake"
+)
+
 if "%ACTION%"=="configure" (
     if exist build-ninja rmdir /s /q build-ninja
     mkdir build-ninja
     cd build-ninja
-    if "%ENABLE_CUDA%"=="ON" (
-        cmake -G "Ninja" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_CUDA=ON -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ..
-    ) else (
-        cmake -G "Ninja" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_CUDA=OFF -DCMAKE_TOOLCHAIN_FILE="C:/vcpkg/scripts/buildsystems/vcpkg.cmake" ..
-    )
+    cmake -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_CUDA=%ENABLE_CUDA% -DUSE_CUDA=%ENABLE_CUDA% %TOOLCHAIN_FLAG% ..
 ) else if "%ACTION%"=="build" (
     cd build-ninja
-    cmake --build .
+    cmake --build . --config Release
+    if exist "C:\Users\HP\Downloads\opencv\build\x64\vc16\bin\opencv_world4140.dll" (
+        copy /y "C:\Users\HP\Downloads\opencv\build\x64\vc16\bin\opencv_world4140.dll" . >nul 2>&1
+    )
+) else if "%ACTION%"=="configure-build" (
+    if exist build-ninja rmdir /s /q build-ninja
+    mkdir build-ninja
+    cd build-ninja
+    cmake -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DENABLE_CUDA=%ENABLE_CUDA% -DUSE_CUDA=%ENABLE_CUDA% %TOOLCHAIN_FLAG% ..
+    cmake --build . --config Release
+    if exist "C:\Users\HP\Downloads\opencv\build\x64\vc16\bin\opencv_world4140.dll" (
+        copy /y "C:\Users\HP\Downloads\opencv\build\x64\vc16\bin\opencv_world4140.dll" . >nul 2>&1
+    )
 )

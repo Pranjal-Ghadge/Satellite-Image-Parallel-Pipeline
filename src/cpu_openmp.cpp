@@ -10,48 +10,53 @@ void process_openmp(const cv::Mat& input, cv::Mat& output, int num_threads) {
     cv::Mat blur_temp = cv::Mat::zeros(rows, cols, CV_8UC1);
     output = cv::Mat::zeros(rows, cols, CV_8UC1);
 
-    int gauss[5][5] = {
-        {1,  4,  7,  4, 1},
-        {4, 16, 26, 16, 4},
-        {7, 26, 41, 26, 7},
-        {4, 16, 26, 16, 4},
-        {1,  4,  7,  4, 1}
-    };
-    int kernel_sum = 273;
+    const int kernel_sum = 273;
 
     omp_set_num_threads(num_threads);
 
-    // Parallel Gaussian Filter
-    #pragma omp parallel for collapse(2) schedule(dynamic)
+    // Stage 1: Parallel 5x5 Gaussian Filter (Spatial Domain Row-Stripe Decomposition)
+    #pragma omp parallel for schedule(static)
     for (int y = 2; y < rows - 2; ++y) {
+        const uchar* r_m2 = input.ptr<uchar>(y - 2);
+        const uchar* r_m1 = input.ptr<uchar>(y - 1);
+        const uchar* r_0  = input.ptr<uchar>(y);
+        const uchar* r_p1 = input.ptr<uchar>(y + 1);
+        const uchar* r_p2 = input.ptr<uchar>(y + 2);
+        uchar* out_row = blur_temp.ptr<uchar>(y);
+
         for (int x = 2; x < cols - 2; ++x) {
-            int sum = 0;
-            for (int ky = -2; ky <= 2; ++ky) {
-                for (int kx = -2; kx <= 2; ++kx) {
-                    sum += input.at<uchar>(y + ky, x + kx) * gauss[ky + 2][kx + 2];
-                }
-            }
-            blur_temp.at<uchar>(y, x) = static_cast<uchar>(sum / kernel_sum);
+            int sum = 
+                (r_m2[x - 2] * 1  + r_m2[x - 1] * 4  + r_m2[x] * 7  + r_m2[x + 1] * 4  + r_m2[x + 2] * 1) +
+                (r_m1[x - 2] * 4  + r_m1[x - 1] * 16 + r_m1[x] * 26 + r_m1[x + 1] * 16 + r_m1[x + 2] * 4) +
+                (r_0 [x - 2] * 7  + r_0 [x - 1] * 26 + r_0 [x] * 41 + r_0 [x + 1] * 26 + r_0 [x + 2] * 7) +
+                (r_p1[x - 2] * 4  + r_p1[x - 1] * 16 + r_p1[x] * 26 + r_p1[x + 1] * 16 + r_p1[x + 2] * 4) +
+                (r_p2[x - 2] * 1  + r_p2[x - 1] * 4  + r_p2[x] * 7  + r_p2[x + 1] * 4  + r_p2[x + 2] * 1);
+
+            out_row[x] = static_cast<uchar>(sum / kernel_sum);
         }
     }
 
-    int Gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
-    int Gy[3][3] = {{-1, -2, -1}, {0, 0, 0}, {1, 2, 1}};
-
-    // Parallel Sobel Edge Detection
-    #pragma omp parallel for collapse(2) schedule(dynamic)
+    // Stage 2: Parallel 3x3 Sobel Gradient & Edge Magnitude Detection
+    #pragma omp parallel for schedule(static)
     for (int y = 1; y < rows - 1; ++y) {
+        const uchar* r_top = blur_temp.ptr<uchar>(y - 1);
+        const uchar* r_mid = blur_temp.ptr<uchar>(y);
+        const uchar* r_bot = blur_temp.ptr<uchar>(y + 1);
+        uchar* out_row = output.ptr<uchar>(y);
+
         for (int x = 1; x < cols - 1; ++x) {
-            int sumX = 0, sumY = 0;
-            for (int ky = -1; ky <= 1; ++ky) {
-                for (int kx = -1; kx <= 1; ++kx) {
-                    uchar val = blur_temp.at<uchar>(y + ky, x + kx);
-                    sumX += val * Gx[ky + 1][kx + 1];
-                    sumY += val * Gy[ky + 1][kx + 1];
-                }
-            }
-            int mag = std::sqrt(sumX * sumX + sumY * sumY);
-            output.at<uchar>(y, x) = static_cast<uchar>(std::min(255, mag));
+            // Horizontal Gradient Gx
+            int sumX = (r_top[x + 1] - r_top[x - 1]) +
+                       2 * (r_mid[x + 1] - r_mid[x - 1]) +
+                       (r_bot[x + 1] - r_bot[x - 1]);
+
+            // Vertical Gradient Gy
+            int sumY = (r_bot[x - 1] - r_top[x - 1]) +
+                       2 * (r_bot[x] - r_top[x]) +
+                       (r_bot[x + 1] - r_top[x + 1]);
+
+            int mag = static_cast<int>(std::sqrt(sumX * sumX + sumY * sumY));
+            out_row[x] = static_cast<uchar>(std::min(255, mag));
         }
     }
 }

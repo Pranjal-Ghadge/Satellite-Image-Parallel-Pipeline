@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     timer.start();
     process_sequential(input, output_seq);
     double seq_time = timer.stop_ms();
-    log_performance("CPU Sequential Baseline", input.cols, input.rows, seq_time);
+    log_performance("CPU Sequential Baseline", input.cols, input.rows, seq_time, seq_time, 1);
     cv::imwrite("data/output/seq_edge.jpg", output_seq);
 
     // 2. OpenMP Thread Scaling Benchmark
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
         timer.start();
         process_openmp(input, output_omp, t);
         double omp_time = timer.stop_ms();
-        log_performance("CPU OpenMP (" + std::to_string(t) + " Threads)", input.cols, input.rows, omp_time, seq_time);
+        log_performance("CPU OpenMP (" + std::to_string(t) + " Threads)", input.cols, input.rows, omp_time, seq_time, t);
     }
     cv::imwrite("data/output/omp_edge.jpg", output_omp);
 
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
     timer.start();
     process_cuda(input, output_cuda);
     double cuda_time = timer.stop_ms();
-    log_performance("GPU CUDA Acceleration", input.cols, input.rows, cuda_time, seq_time);
+    log_performance("GPU CUDA Acceleration", input.cols, input.rows, cuda_time, seq_time, 0);
     cv::imwrite("data/output/cuda_edge.jpg", output_cuda);
 #endif
 

@@ -21,6 +21,6 @@ public:
     }
 };
 
-void log_performance(const std::string& mode, int width, int height, double execution_time_ms, double baseline_time_ms = 0.0);
+void log_performance(const std::string& mode, int width, int height, double execution_time_ms, double baseline_time_ms = 0.0, int num_threads = 1);
 
 #endif
