@@ -100,6 +100,64 @@ void print_spatial_summary(
     std::cout << summary.str();
 }
 
+bool create_flood_visualizations(
+    const cv::Mat& post_normalized,
+    const cv::Mat& semantic_map,
+    const cv::Mat& flood_mask,
+    cv::Mat& pre_water_visualization,
+    cv::Mat& post_water_visualization,
+    cv::Mat& flood_overlay,
+    std::string& error) {
+    if (post_normalized.empty() || post_normalized.type() != CV_32FC1 ||
+        semantic_map.empty() || semantic_map.type() != CV_8UC1 ||
+        flood_mask.empty() || flood_mask.type() != CV_8UC1 ||
+        post_normalized.size() != semantic_map.size() ||
+        flood_mask.size() != semantic_map.size()) {
+        error = "Flood visualization requires matching normalized image, semantic map, and flood mask.";
+        return false;
+    }
+
+    pre_water_visualization.create(semantic_map.size(), CV_8UC1);
+    post_water_visualization.create(semantic_map.size(), CV_8UC1);
+    cv::Mat post_grayscale;
+    post_normalized.convertTo(post_grayscale, CV_8UC1, 255.0);
+    cv::cvtColor(post_grayscale, flood_overlay, cv::COLOR_GRAY2BGR);
+
+    for (int y = 0; y < semantic_map.rows; ++y) {
+        const std::uint8_t* classes = semantic_map.ptr<std::uint8_t>(y);
+        const std::uint8_t* flood = flood_mask.ptr<std::uint8_t>(y);
+        std::uint8_t* pre_water =
+            pre_water_visualization.ptr<std::uint8_t>(y);
+        std::uint8_t* post_water =
+            post_water_visualization.ptr<std::uint8_t>(y);
+        cv::Vec3b* overlay = flood_overlay.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < semantic_map.cols; ++x) {
+            if (classes[x] > 3 ||
+                (classes[x] == 2) != (flood[x] == 255)) {
+                error = "Flood visualization found inconsistent flood or semantic classes.";
+                return false;
+            }
+            const bool was_water = classes[x] == 1 || classes[x] == 3;
+            const bool is_water = classes[x] == 1 || classes[x] == 2;
+            pre_water[x] = was_water ? 255 : 0;
+            post_water[x] = is_water ? 255 : 0;
+            if (classes[x] == 1 || classes[x] == 2) {
+                const cv::Vec3b color = classes[x] == 1
+                    ? cv::Vec3b(255, 190, 0)
+                    : cv::Vec3b(0, 55, 255);
+                constexpr double image_weight = 0.45;
+                constexpr double color_weight = 0.55;
+                for (int channel = 0; channel < 3; ++channel) {
+                    overlay[x][channel] = cv::saturate_cast<std::uint8_t>(
+                        image_weight * overlay[x][channel] +
+                        color_weight * color[channel]);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -432,6 +490,25 @@ int main(int argc, char** argv) {
         }
 #endif
 
+        FloodAreaStatistics area_statistics;
+        if (!compute_flood_area_statistics(
+                semantic_map, new_flood_mask, metadata,
+                area_statistics, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+
+        cv::Mat pre_water_visualization;
+        cv::Mat post_water_visualization;
+        cv::Mat flood_overlay;
+        if (!create_flood_visualizations(
+                post_normalized, semantic_map, new_flood_mask,
+                pre_water_visualization, post_water_visualization,
+                flood_overlay, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+
         try {
             std::filesystem::create_directories("data/output");
         } catch (const std::filesystem::filesystem_error& exception) {
@@ -439,26 +516,65 @@ int main(int argc, char** argv) {
                       << exception.what() << std::endl;
             return 1;
         }
-        if (!cv::imwrite("data/output/pre_water_mask.png", pre_water_mask) ||
-            !cv::imwrite("data/output/post_water_mask.png", post_water_mask) ||
-            !cv::imwrite("data/output/new_flood_mask.png", new_flood_mask) ||
-            !cv::imwrite("data/output/semantic_classification.png", semantic_map)) {
-            std::cerr << "Error: Unable to write water/flood classification masks to data/output/.\n";
+        try {
+            if (!cv::imwrite(
+                    "data/output/pre_water_mask.png", pre_water_visualization) ||
+                !cv::imwrite(
+                    "data/output/post_water_mask.png", post_water_visualization) ||
+                !cv::imwrite("data/output/flood_mask.png", new_flood_mask) ||
+                !cv::imwrite("data/output/new_flood_mask.png", new_flood_mask) ||
+                !cv::imwrite("data/output/flood_overlay.png", flood_overlay) ||
+                !cv::imwrite("data/output/semantic_classification.png", semantic_map)) {
+                std::cerr << "Error: Unable to write flood visualization images to data/output/.\n";
+                return 1;
+            }
+        } catch (const cv::Exception& exception) {
+            std::cerr << "Error: Unable to write flood visualization images: "
+                      << exception.what() << std::endl;
             return 1;
         }
 
-        const int pre_water_pixels = cv::countNonZero(pre_water_mask);
-        const int post_water_pixels = cv::countNonZero(post_water_mask);
-        std::cout << "Water masks matched across active implementations.\n"
-                  << "Pre-water pixels: " << pre_water_pixels << " / "
-                  << pre_water_mask.total() << ".\n"
-                  << "Post-water pixels: " << post_water_pixels << " / "
-                  << post_water_mask.total() << ".\n"
+        if (!write_flood_report(
+                "data/output/flood_report.json", pre_path, post_path,
+                pre_intensity.cols, pre_intensity.rows, metadata,
+                area_statistics, auto_threshold,
+                pre_active_threshold, post_active_threshold,
+                minimum_patch_pixels, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+        if (!write_flood_csv_report(
+                "data/output/flood_report.csv", pre_path, post_path,
+                pre_intensity.cols, pre_intensity.rows, metadata,
+                area_statistics, auto_threshold,
+                pre_active_threshold, post_active_threshold,
+                minimum_patch_pixels, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+
+        std::cout << std::fixed << std::setprecision(6)
+                  << "Flood area statistics (from cleaned semantic map):\n"
+                  << "  Total scene: " << area_statistics.total_scene_km2 << " km^2\n"
+                  << "  Pre-flood water (permanent + receded): "
+                  << area_statistics.pre_flood_water_km2 << " km^2\n"
+                  << "  Permanent water: " << area_statistics.permanent_water_km2
+                  << " km^2\n"
+                  << "  Post-flood total water: "
+                  << area_statistics.post_flood_water_km2 << " km^2\n"
+                  << "  Newly inundated: " << area_statistics.new_flood_km2
+                  << " km^2 (" << area_statistics.new_flood_hectares << " ha, "
+                  << area_statistics.new_flood_percentage_of_scene
+                  << "% of scene)\n"
+                  << "  Receded water: " << area_statistics.receded_water_km2
+                  << " km^2\n"
+                  << "Water masks matched across active implementations.\n"
                   << "Flood and semantic maps match across all enabled implementations.\n"
-                  << "Saved masks: data/output/pre_water_mask.png, "
-                     "data/output/post_water_mask.png, data/output/new_flood_mask.png, "
-                     "data/output/semantic_classification.png (0=dry, 1=permanent water, "
-                     "2=new flood, 3=receded water).\n";
+                  << "Saved data/output/pre_water_mask.png, "
+                     "data/output/post_water_mask.png, data/output/flood_mask.png, "
+                     "data/output/flood_overlay.png, and "
+                     "data/output/flood_report.json and "
+                     "data/output/flood_report.csv.\n";
         return 0;
     }
 

@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "sar_preprocessing.h"
 
 #include <algorithm>
 #include <array>
@@ -6,6 +7,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <utility>
 
@@ -16,6 +18,56 @@ std::string lowercase(std::string value) {
         return static_cast<char>(std::tolower(ch));
     });
     return value;
+}
+
+std::string json_escape(const std::string& value) {
+    std::ostringstream escaped;
+    for (const unsigned char ch : value) {
+        switch (ch) {
+        case '"':
+            escaped << "\\\"";
+            break;
+        case '\\':
+            escaped << "\\\\";
+            break;
+        case '\b':
+            escaped << "\\b";
+            break;
+        case '\f':
+            escaped << "\\f";
+            break;
+        case '\n':
+            escaped << "\\n";
+            break;
+        case '\r':
+            escaped << "\\r";
+            break;
+        case '\t':
+            escaped << "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                constexpr char hex[] = "0123456789abcdef";
+                escaped << "\\u00" << hex[ch >> 4] << hex[ch & 0x0f];
+            } else {
+                escaped << static_cast<char>(ch);
+            }
+        }
+    }
+    return escaped.str();
+}
+
+std::string csv_escape(const std::string& value) {
+    std::string escaped = "\"";
+    for (const char ch : value) {
+        if (ch == '"') {
+            escaped += "\"\"";
+        } else {
+            escaped += ch;
+        }
+    }
+    escaped += '"';
+    return escaped;
 }
 
 bool read_world_file(
@@ -297,6 +349,280 @@ double pixel_count_to_hectares(
     std::size_t pixel_count,
     const SpatialMetadata& metadata) {
     return static_cast<double>(pixel_count) * metadata.area_per_pixel_m2 / 10'000.0;
+}
+
+bool compute_flood_area_statistics(
+    const cv::Mat& semantic_map,
+    const cv::Mat& flood_mask,
+    const SpatialMetadata& metadata,
+    FloodAreaStatistics& statistics,
+    std::string& error) {
+    if (semantic_map.empty() || semantic_map.type() != CV_8UC1 ||
+        flood_mask.empty() || flood_mask.type() != CV_8UC1 ||
+        semantic_map.size() != flood_mask.size()) {
+        error = "Area quantification requires matching, non-empty CV_8UC1 flood and semantic maps.";
+        return false;
+    }
+    if (!std::isfinite(metadata.area_per_pixel_m2) ||
+        metadata.area_per_pixel_m2 <= 0.0) {
+        error = "Area quantification requires a finite, positive pixel area.";
+        return false;
+    }
+
+    FloodAreaStatistics computed;
+    computed.total_scene_pixels =
+        static_cast<std::uint64_t>(semantic_map.rows) *
+        static_cast<std::uint64_t>(semantic_map.cols);
+    for (int y = 0; y < semantic_map.rows; ++y) {
+        const std::uint8_t* classes = semantic_map.ptr<std::uint8_t>(y);
+        const std::uint8_t* flood = flood_mask.ptr<std::uint8_t>(y);
+        for (int x = 0; x < semantic_map.cols; ++x) {
+            switch (classes[x]) {
+            case 0:
+                if (flood[x] != 0) {
+                    error = "Flood mask and semantic map disagree at a dry-land pixel.";
+                    return false;
+                }
+                break;
+            case 1:
+                if (flood[x] != 0) {
+                    error = "Flood mask and semantic map disagree at a permanent-water pixel.";
+                    return false;
+                }
+                ++computed.permanent_water_pixels;
+                break;
+            case 2:
+                if (flood[x] != 255) {
+                    error = "Flood mask and semantic map disagree at a newly inundated pixel.";
+                    return false;
+                }
+                ++computed.new_flood_pixels;
+                break;
+            case 3:
+                if (flood[x] != 0) {
+                    error = "Flood mask and semantic map disagree at a receded-water pixel.";
+                    return false;
+                }
+                ++computed.receded_water_pixels;
+                break;
+            default:
+                error = "Semantic map contains an unsupported class value.";
+                return false;
+            }
+        }
+    }
+
+    computed.pre_flood_water_pixels =
+        computed.permanent_water_pixels + computed.receded_water_pixels;
+    computed.post_flood_water_pixels =
+        computed.permanent_water_pixels + computed.new_flood_pixels;
+    computed.total_scene_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.total_scene_pixels), metadata);
+    computed.permanent_water_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.permanent_water_pixels), metadata);
+    computed.pre_flood_water_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.pre_flood_water_pixels), metadata);
+    computed.post_flood_water_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.post_flood_water_pixels), metadata);
+    computed.new_flood_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.new_flood_pixels), metadata);
+    computed.new_flood_hectares = pixel_count_to_hectares(
+        static_cast<std::size_t>(computed.new_flood_pixels), metadata);
+    computed.receded_water_km2 = pixel_count_to_square_kilometers(
+        static_cast<std::size_t>(computed.receded_water_pixels), metadata);
+    computed.new_flood_percentage_of_scene =
+        computed.total_scene_pixels == 0
+        ? 0.0
+        : 100.0 * static_cast<double>(computed.new_flood_pixels) /
+            static_cast<double>(computed.total_scene_pixels);
+    statistics = computed;
+    return true;
+}
+
+bool write_flood_report(
+    const std::string& output_path,
+    const std::string& pre_image_path,
+    const std::string& post_image_path,
+    int width,
+    int height,
+    const SpatialMetadata& metadata,
+    const FloodAreaStatistics& statistics,
+    bool auto_threshold,
+    float pre_threshold,
+    float post_threshold,
+    int minimum_patch_pixels,
+    std::string& error) {
+    if (width <= 0 || height <= 0 || minimum_patch_pixels <= 0 ||
+        !std::isfinite(metadata.pixel_size_x_m) ||
+        !std::isfinite(metadata.pixel_size_y_m) ||
+        !std::isfinite(pre_threshold) || !std::isfinite(post_threshold)) {
+        error = "Cannot write flood report: dimensions or processing parameters are invalid.";
+        return false;
+    }
+
+    std::ofstream report(output_path, std::ios::out | std::ios::trunc);
+    if (!report) {
+        error = "Unable to open flood report for writing: " + output_path;
+        return false;
+    }
+
+    report << std::setprecision(15)
+        << "{\n"
+        << "  \"images\": {\n"
+        << "    \"pre_flood\": \"" << json_escape(pre_image_path) << "\",\n"
+        << "    \"post_flood\": \"" << json_escape(post_image_path) << "\",\n"
+        << "    \"width_pixels\": " << width << ",\n"
+        << "    \"height_pixels\": " << height << "\n"
+        << "  },\n"
+        << "  \"spatial_resolution\": {\n"
+        << "    \"pixel_size_x_m\": " << metadata.pixel_size_x_m << ",\n"
+        << "    \"pixel_size_y_m\": " << metadata.pixel_size_y_m << ",\n"
+        << "    \"area_per_pixel_m2\": " << metadata.area_per_pixel_m2 << ",\n"
+        << "    \"metadata_status\": \"" << json_escape(metadata.status) << "\"\n"
+        << "  },\n"
+        << "  \"bounding_coordinates\": ";
+    if (metadata.has_origin_lat_lon || metadata.world_file_used) {
+        report << "{\n"
+            << "    \"geographic_origin\": ";
+        if (metadata.has_origin_lat_lon) {
+            report << "{ \"latitude_deg\": " << metadata.origin_lat_deg
+                   << ", \"longitude_deg\": " << metadata.origin_lon_deg << " }";
+        } else {
+            report << "null";
+        }
+        report << ",\n"
+            << "    \"projected_world_file_origin_m\": ";
+        if (metadata.world_file_used) {
+            report << "{ \"x\": " << metadata.world_origin_x
+                   << ", \"y\": " << metadata.world_origin_y << " }";
+        } else {
+            report << "null";
+        }
+        report << ",\n"
+            << "    \"full_extent\": null\n"
+            << "  },\n";
+    } else {
+        report << "null,\n";
+    }
+    report
+        << "  \"pixel_counts\": {\n"
+        << "    \"total_scene\": " << statistics.total_scene_pixels << ",\n"
+        << "    \"permanent_water\": " << statistics.permanent_water_pixels << ",\n"
+        << "    \"pre_flood_water\": " << statistics.pre_flood_water_pixels << ",\n"
+        << "    \"post_flood_total_water\": " << statistics.post_flood_water_pixels << ",\n"
+        << "    \"newly_inundated_flood\": " << statistics.new_flood_pixels << ",\n"
+        << "    \"receded_water\": " << statistics.receded_water_pixels << "\n"
+        << "  },\n"
+        << "  \"areas\": {\n"
+        << "    \"total_scene_km2\": " << statistics.total_scene_km2 << ",\n"
+        << "    \"permanent_water_km2\": " << statistics.permanent_water_km2 << ",\n"
+        << "    \"pre_flood_water_km2\": " << statistics.pre_flood_water_km2 << ",\n"
+        << "    \"post_flood_total_water_km2\": " << statistics.post_flood_water_km2 << ",\n"
+        << "    \"newly_inundated_flood_km2\": " << statistics.new_flood_km2 << ",\n"
+        << "    \"newly_inundated_flood_hectares\": " << statistics.new_flood_hectares << ",\n"
+        << "    \"receded_water_km2\": " << statistics.receded_water_km2 << ",\n"
+        << "    \"newly_inundated_flood_percent_of_scene\": "
+        << statistics.new_flood_percentage_of_scene << "\n"
+        << "  },\n"
+        << "  \"processing_parameters\": {\n"
+        << "    \"normalization\": \"shared linear min-max [0, 1]\",\n"
+        << "    \"lee_window_size\": " << kLeeWindowSize << ",\n"
+        << "    \"lee_equivalent_looks\": " << kLeeEquivalentLooks << ",\n"
+        << "    \"threshold_mode\": \"" << (auto_threshold ? "otsu" : "manual") << "\",\n"
+        << "    \"pre_water_threshold\": " << pre_threshold << ",\n"
+        << "    \"post_water_threshold\": " << post_threshold << ",\n"
+        << "    \"minimum_patch_pixels\": " << minimum_patch_pixels << ",\n"
+        << "    \"cleanup\": \"3x3 opening, 3x3 closing, 8-connected component filter\"\n"
+        << "  }\n"
+        << "}\n";
+    if (!report) {
+        error = "Failed while writing flood report: " + output_path;
+        return false;
+    }
+    return true;
+}
+
+bool write_flood_csv_report(
+    const std::string& output_path,
+    const std::string& pre_image_path,
+    const std::string& post_image_path,
+    int width,
+    int height,
+    const SpatialMetadata& metadata,
+    const FloodAreaStatistics& statistics,
+    bool auto_threshold,
+    float pre_threshold,
+    float post_threshold,
+    int minimum_patch_pixels,
+    std::string& error) {
+    if (width <= 0 || height <= 0 || minimum_patch_pixels <= 0 ||
+        !std::isfinite(metadata.pixel_size_x_m) ||
+        !std::isfinite(metadata.pixel_size_y_m) ||
+        !std::isfinite(pre_threshold) || !std::isfinite(post_threshold)) {
+        error = "Cannot write flood CSV report: dimensions or processing parameters are invalid.";
+        return false;
+    }
+
+    std::ofstream report(output_path, std::ios::out | std::ios::trunc);
+    if (!report) {
+        error = "Unable to open flood CSV report for writing: " + output_path;
+        return false;
+    }
+
+    report << "section,key,value,unit\n"
+        << "images,pre_flood_path," << csv_escape(pre_image_path) << ",\n"
+        << "images,post_flood_path," << csv_escape(post_image_path) << ",\n"
+        << "images,width," << width << ",pixels\n"
+        << "images,height," << height << ",pixels\n"
+        << "spatial_resolution,pixel_size_x," << std::setprecision(15)
+        << metadata.pixel_size_x_m << ",m/pixel\n"
+        << "spatial_resolution,pixel_size_y," << metadata.pixel_size_y_m << ",m/pixel\n"
+        << "spatial_resolution,area_per_pixel," << metadata.area_per_pixel_m2 << ",m2\n"
+        << "spatial_resolution,metadata_status,"
+        << csv_escape(metadata.status) << ",\n";
+    if (metadata.has_origin_lat_lon) {
+        report << "bounding_coordinates,origin_latitude,"
+               << metadata.origin_lat_deg << ",degrees\n"
+               << "bounding_coordinates,origin_longitude,"
+               << metadata.origin_lon_deg << ",degrees\n";
+    }
+    if (metadata.world_file_used) {
+        report << "bounding_coordinates,world_file_origin_x,"
+               << metadata.world_origin_x << ",projected_m\n"
+               << "bounding_coordinates,world_file_origin_y,"
+               << metadata.world_origin_y << ",projected_m\n";
+    }
+    report << "pixel_counts,total_scene," << statistics.total_scene_pixels << ",pixels\n"
+        << "pixel_counts,permanent_water," << statistics.permanent_water_pixels << ",pixels\n"
+        << "pixel_counts,pre_flood_water," << statistics.pre_flood_water_pixels << ",pixels\n"
+        << "pixel_counts,post_flood_total_water," << statistics.post_flood_water_pixels << ",pixels\n"
+        << "pixel_counts,newly_inundated_flood," << statistics.new_flood_pixels << ",pixels\n"
+        << "pixel_counts,receded_water," << statistics.receded_water_pixels << ",pixels\n"
+        << "areas,total_scene," << statistics.total_scene_km2 << ",km2\n"
+        << "areas,permanent_water," << statistics.permanent_water_km2 << ",km2\n"
+        << "areas,pre_flood_water," << statistics.pre_flood_water_km2 << ",km2\n"
+        << "areas,post_flood_total_water," << statistics.post_flood_water_km2 << ",km2\n"
+        << "areas,newly_inundated_flood," << statistics.new_flood_km2 << ",km2\n"
+        << "areas,newly_inundated_flood," << statistics.new_flood_hectares << ",ha\n"
+        << "areas,newly_inundated_flood_percent_of_scene,"
+        << statistics.new_flood_percentage_of_scene << ",percent\n"
+        << "areas,receded_water," << statistics.receded_water_km2 << ",km2\n"
+        << "processing_parameters,threshold_mode,"
+        << (auto_threshold ? "otsu" : "manual") << ",\n"
+        << "processing_parameters,pre_water_threshold," << pre_threshold << ",normalized\n"
+        << "processing_parameters,post_water_threshold," << post_threshold << ",normalized\n"
+        << "processing_parameters,minimum_patch_pixels,"
+        << minimum_patch_pixels << ",pixels\n"
+        << "processing_parameters,lee_window_size," << kLeeWindowSize << ",pixels\n"
+        << "processing_parameters,lee_equivalent_looks,"
+        << kLeeEquivalentLooks << ",\n"
+        << "processing_parameters,cleanup,"
+        << csv_escape("3x3 opening, 3x3 closing, 8-connected component filter") << ",\n";
+    if (!report) {
+        error = "Failed while writing flood CSV report: " + output_path;
+        return false;
+    }
+    return true;
 }
 
 void log_performance(const std::string& mode, int width, int height, double execution_time_ms, double baseline_time_ms) {

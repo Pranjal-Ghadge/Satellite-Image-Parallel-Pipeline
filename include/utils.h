@@ -4,6 +4,7 @@
 #include <iostream>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <string>
 #include <fstream>
 #include <opencv2/opencv.hpp>
@@ -50,6 +51,23 @@ struct SpatialMetadata {
     std::string status;
 };
 
+struct FloodAreaStatistics {
+    std::uint64_t total_scene_pixels = 0;
+    std::uint64_t permanent_water_pixels = 0;
+    std::uint64_t pre_flood_water_pixels = 0;
+    std::uint64_t post_flood_water_pixels = 0;
+    std::uint64_t new_flood_pixels = 0;
+    std::uint64_t receded_water_pixels = 0;
+    double total_scene_km2 = 0.0;
+    double permanent_water_km2 = 0.0;
+    double pre_flood_water_km2 = 0.0;
+    double post_flood_water_km2 = 0.0;
+    double new_flood_km2 = 0.0;
+    double new_flood_hectares = 0.0;
+    double new_flood_percentage_of_scene = 0.0;
+    double receded_water_km2 = 0.0;
+};
+
 bool load_spatial_metadata(
     const std::string& image_path,
     double configured_pixel_size_m,
@@ -58,5 +76,37 @@ bool load_spatial_metadata(
     std::string& error);
 double pixel_count_to_square_kilometers(std::size_t pixel_count, const SpatialMetadata& metadata);
 double pixel_count_to_hectares(std::size_t pixel_count, const SpatialMetadata& metadata);
+bool compute_flood_area_statistics(
+    const cv::Mat& semantic_map,
+    const cv::Mat& flood_mask,
+    const SpatialMetadata& metadata,
+    FloodAreaStatistics& statistics,
+    std::string& error);
+bool write_flood_report(
+    const std::string& output_path,
+    const std::string& pre_image_path,
+    const std::string& post_image_path,
+    int width,
+    int height,
+    const SpatialMetadata& metadata,
+    const FloodAreaStatistics& statistics,
+    bool auto_threshold,
+    float pre_threshold,
+    float post_threshold,
+    int minimum_patch_pixels,
+    std::string& error);
+bool write_flood_csv_report(
+    const std::string& output_path,
+    const std::string& pre_image_path,
+    const std::string& post_image_path,
+    int width,
+    int height,
+    const SpatialMetadata& metadata,
+    const FloodAreaStatistics& statistics,
+    bool auto_threshold,
+    float pre_threshold,
+    float post_threshold,
+    int minimum_patch_pixels,
+    std::string& error);
 
 #endif
