@@ -1,6 +1,8 @@
 #include "cpu_sequential.h"
+#include "sar_preprocessing.h"
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 
 void process_sequential(const cv::Mat& input, cv::Mat& output) {
     int rows = input.rows;
@@ -27,6 +29,7 @@ void process_sequential(const cv::Mat& input, cv::Mat& output) {
                 for (int kx = -2; kx <= 2; ++kx) {
                     sum += input.at<uchar>(y + ky, x + kx) * gauss[ky + 2][kx + 2];
                 }
+
             }
             blur_temp.at<uchar>(y, x) = static_cast<uchar>(sum / kernel_sum);
         }
@@ -49,6 +52,21 @@ void process_sequential(const cv::Mat& input, cv::Mat& output) {
             }
             int mag = std::sqrt(sumX * sumX + sumY * sumY);
             output.at<uchar>(y, x) = static_cast<uchar>(std::min(255, mag));
+        }
+    }
+}
+
+void process_lee_sequential(const cv::Mat& input, cv::Mat& output) {
+    if (input.empty() || input.type() != CV_32FC1) {
+        throw std::invalid_argument(
+            "process_lee_sequential requires a non-empty CV_32FC1 image");
+    }
+
+    output.create(input.size(), CV_32FC1);
+    for (int y = 0; y < input.rows; ++y) {
+        float* output_row = output.ptr<float>(y);
+        for (int x = 0; x < input.cols; ++x) {
+            output_row[x] = lee_filter_pixel(input, y, x);
         }
     }
 }

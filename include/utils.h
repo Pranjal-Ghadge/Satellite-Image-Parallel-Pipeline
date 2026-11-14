@@ -29,6 +29,12 @@ bool load_image_pair(
     cv::Mat& pre_intensity,
     cv::Mat& post_intensity,
     std::string& error);
+bool normalize_sar_pair(
+    const cv::Mat& pre_intensity,
+    const cv::Mat& post_intensity,
+    cv::Mat& pre_normalized,
+    cv::Mat& post_normalized,
+    std::string& error);
 
 struct SpatialMetadata {
     double pixel_size_x_m = 10.0;

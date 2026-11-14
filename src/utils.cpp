@@ -171,6 +171,50 @@ bool load_image_pair(
     return true;
 }
 
+bool normalize_sar_pair(
+    const cv::Mat& pre_intensity,
+    const cv::Mat& post_intensity,
+    cv::Mat& pre_normalized,
+    cv::Mat& post_normalized,
+    std::string& error) {
+    if (pre_intensity.empty() || post_intensity.empty() ||
+        pre_intensity.type() != CV_32FC1 || post_intensity.type() != CV_32FC1 ||
+        pre_intensity.size() != post_intensity.size()) {
+        error = "SAR pair normalization requires matching, non-empty CV_32FC1 images.";
+        return false;
+    }
+    if (!cv::checkRange(pre_intensity) || !cv::checkRange(post_intensity)) {
+        error = "SAR image intensities must contain only finite values.";
+        return false;
+    }
+
+    double pre_min = 0.0;
+    double pre_max = 0.0;
+    double post_min = 0.0;
+    double post_max = 0.0;
+    cv::minMaxLoc(pre_intensity, &pre_min, &pre_max);
+    cv::minMaxLoc(post_intensity, &post_min, &post_max);
+    const double shared_min = std::min(pre_min, post_min);
+    const double shared_max = std::max(pre_max, post_max);
+    const double shared_range = shared_max - shared_min;
+
+    if (!std::isfinite(shared_range)) {
+        error = "SAR pair has an invalid intensity range.";
+        return false;
+    }
+    if (shared_range == 0.0) {
+        pre_normalized = cv::Mat::zeros(pre_intensity.size(), CV_32FC1);
+        post_normalized = cv::Mat::zeros(post_intensity.size(), CV_32FC1);
+        return true;
+    }
+
+    const double scale = 1.0 / shared_range;
+    const double offset = -shared_min * scale;
+    pre_intensity.convertTo(pre_normalized, CV_32FC1, scale, offset);
+    post_intensity.convertTo(post_normalized, CV_32FC1, scale, offset);
+    return true;
+}
+
 bool load_spatial_metadata(
     const std::string& image_path,
     double configured_pixel_size_m,

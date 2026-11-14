@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 
 __global__ void gaussian_blur_kernel(
     const unsigned char* __restrict__ input,
@@ -63,6 +64,54 @@ __global__ void sobel_kernel(
     }
 }
 
+__global__ void lee_filter_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int width,
+    int height)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    constexpr int radius = 2;
+    constexpr float sample_count = 25.0f;
+    constexpr float equivalent_looks = 4.0f;
+    constexpr float epsilon = 1e-12f;
+    float sum = 0.0f;
+    float sum_squares = 0.0f;
+
+    for (int ky = -radius; ky <= radius; ++ky) {
+        const int sample_y = max(0, min(height - 1, y + ky));
+        for (int kx = -radius; kx <= radius; ++kx) {
+            const int sample_x = max(0, min(width - 1, x + kx));
+            const float value = input[sample_y * width + sample_x];
+            sum += value;
+            sum_squares += value * value;
+        }
+    }
+
+    const float local_mean = sum / sample_count;
+    const float local_variance =
+        fmaxf(0.0f, sum_squares / sample_count - local_mean * local_mean);
+    const float noise_variance =
+        local_mean * local_mean / equivalent_looks;
+    const float weight = fmaxf(
+        0.0f,
+        (local_variance - noise_variance) / (local_variance + epsilon));
+    const float center = input[y * width + x];
+    output[y * width + x] = local_mean + weight * (center - local_mean);
+}
+
+void check_cuda_result(cudaError_t result, const char* operation) {
+    if (result != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(operation) + " failed: " + cudaGetErrorString(result));
+    }
+}
+
 void process_cuda(const cv::Mat& input, cv::Mat& output) {
     int width = input.cols;
     int height = input.rows;
@@ -109,4 +158,57 @@ void process_cuda(const cv::Mat& input, cv::Mat& output) {
     cudaFree(d_blurred);
     cudaFree(d_output);
     cudaStreamDestroy(stream);
+}
+
+void process_lee_cuda(const cv::Mat& input, cv::Mat& output) {
+    if (input.empty() || input.type() != CV_32FC1) {
+        throw std::invalid_argument(
+            "process_lee_cuda requires a non-empty CV_32FC1 image");
+    }
+
+    const int width = input.cols;
+    const int height = input.rows;
+    const size_t image_bytes =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float);
+    cv::Mat contiguous_input = input.isContinuous() ? input : input.clone();
+    output.create(input.size(), CV_32FC1);
+
+    float* device_input = nullptr;
+    float* device_output = nullptr;
+    try {
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_input), image_bytes),
+            "cudaMalloc input");
+        check_cuda_result(
+            cudaMalloc(reinterpret_cast<void**>(&device_output), image_bytes),
+            "cudaMalloc output");
+        check_cuda_result(
+            cudaMemcpy(device_input, contiguous_input.ptr<float>(),
+                image_bytes, cudaMemcpyHostToDevice),
+            "cudaMemcpy input");
+
+        const dim3 block_size(16, 16);
+        const dim3 grid_size(
+            (width + block_size.x - 1) / block_size.x,
+            (height + block_size.y - 1) / block_size.y);
+        lee_filter_kernel<<<grid_size, block_size>>>(
+            device_input, device_output, width, height);
+        check_cuda_result(cudaGetLastError(), "Lee filter kernel launch");
+        check_cuda_result(cudaDeviceSynchronize(), "Lee filter kernel execution");
+        check_cuda_result(
+            cudaMemcpy(output.ptr<float>(), device_output,
+                image_bytes, cudaMemcpyDeviceToHost),
+            "cudaMemcpy output");
+    } catch (...) {
+        if (device_input) {
+            cudaFree(device_input);
+        }
+        if (device_output) {
+            cudaFree(device_output);
+        }
+        throw;
+    }
+
+    check_cuda_result(cudaFree(device_input), "cudaFree input");
+    check_cuda_result(cudaFree(device_output), "cudaFree output");
 }

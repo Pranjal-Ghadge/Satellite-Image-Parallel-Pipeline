@@ -1,4 +1,5 @@
 #include <iostream>
+#include <algorithm>
 #include <cstdlib>
 #include <exception>
 #include <iomanip>
@@ -9,6 +10,7 @@
 #include <string>
 #include <opencv2/opencv.hpp>
 #include "utils.h"
+#include "sar_preprocessing.h"
 #include "cpu_sequential.h"
 #include "cpu_openmp.h"
 #ifdef USE_CUDA
@@ -205,6 +207,15 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        cv::Mat pre_normalized;
+        cv::Mat post_normalized;
+        if (!normalize_sar_pair(
+                pre_intensity, post_intensity,
+                pre_normalized, post_normalized, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+
         SpatialMetadata metadata;
         if (!load_spatial_metadata(
                 pre_path, configured_pixel_size_m, pixel_size_overridden, metadata, error)) {
@@ -220,7 +231,73 @@ int main(int argc, char** argv) {
         std::cout << "Validated pre-/post-flood image pair: "
                   << pre_intensity.cols << "x" << pre_intensity.rows
                   << " pixels; both converted to single-channel CV_32F intensity.\n";
+        std::cout << "Applied shared linear intensity normalization to [0, 1].\n"
+                  << "Applying " << kLeeWindowSize << "x" << kLeeWindowSize
+                  << " Lee speckle filter (equivalent looks: "
+                  << kLeeEquivalentLooks << ").\n";
         print_spatial_summary(pre_intensity.cols, pre_intensity.rows, metadata);
+
+        cv::Mat pre_sequential;
+        cv::Mat post_sequential;
+        Timer preprocessing_timer;
+        preprocessing_timer.start();
+        process_lee_sequential(pre_normalized, pre_sequential);
+        process_lee_sequential(post_normalized, post_sequential);
+        const double sequential_time_ms = preprocessing_timer.stop_ms();
+        std::cout << "Sequential Lee filtering (pre + post): "
+                  << sequential_time_ms << " ms.\n";
+
+        cv::Mat pre_openmp;
+        cv::Mat post_openmp;
+        for (int thread_count : threads_to_test) {
+            preprocessing_timer.start();
+            process_lee_openmp(pre_normalized, pre_openmp, thread_count);
+            process_lee_openmp(post_normalized, post_openmp, thread_count);
+            const double openmp_time_ms = preprocessing_timer.stop_ms();
+            const double pre_difference =
+                cv::norm(pre_sequential, pre_openmp, cv::NORM_INF);
+            const double post_difference =
+                cv::norm(post_sequential, post_openmp, cv::NORM_INF);
+            const double max_difference = std::max(pre_difference, post_difference);
+            std::cout << "OpenMP Lee filtering (" << thread_count
+                      << " threads, pre + post): " << openmp_time_ms
+                      << " ms; max abs. difference from sequential: "
+                      << std::scientific << max_difference << std::fixed << ".\n";
+            if (max_difference != 0.0) {
+                std::cerr << "Error: Sequential and OpenMP Lee outputs do not match exactly.\n";
+                return 1;
+            }
+        }
+
+#ifdef USE_CUDA
+        try {
+            cv::Mat pre_cuda;
+            cv::Mat post_cuda;
+            preprocessing_timer.start();
+            process_lee_cuda(pre_normalized, pre_cuda);
+            process_lee_cuda(post_normalized, post_cuda);
+            const double cuda_time_ms = preprocessing_timer.stop_ms();
+            const double pre_difference =
+                cv::norm(pre_sequential, pre_cuda, cv::NORM_INF);
+            const double post_difference =
+                cv::norm(post_sequential, post_cuda, cv::NORM_INF);
+            const double max_difference =
+                std::max(pre_difference, post_difference);
+            std::cout << "CUDA Lee filtering (pre + post): " << cuda_time_ms
+                      << " ms; max abs. difference from sequential: "
+                      << std::scientific
+                      << max_difference
+                      << std::fixed << ".\n";
+            if (max_difference > 1e-5) {
+                std::cerr << "Error: CUDA Lee output differs from sequential beyond tolerance.\n";
+                return 1;
+            }
+        } catch (const std::exception& exception) {
+            std::cerr << "Error: CUDA Lee preprocessing failed: "
+                      << exception.what() << std::endl;
+            return 1;
+        }
+#endif
         return 0;
     }
 
