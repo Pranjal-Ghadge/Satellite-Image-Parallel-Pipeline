@@ -451,6 +451,7 @@ bool write_flood_report(
     float pre_threshold,
     float post_threshold,
     int minimum_patch_pixels,
+    const std::vector<BenchmarkResult>& benchmarks,
     std::string& error) {
     if (width <= 0 || height <= 0 || minimum_patch_pixels <= 0 ||
         !std::isfinite(metadata.pixel_size_x_m) ||
@@ -533,6 +534,49 @@ bool write_flood_report(
         << "    \"post_water_threshold\": " << post_threshold << ",\n"
         << "    \"minimum_patch_pixels\": " << minimum_patch_pixels << ",\n"
         << "    \"cleanup\": \"3x3 opening, 3x3 closing, 8-connected component filter\"\n"
+        << "  },\n"
+        << "  \"benchmark\": {\n";
+    bool has_baseline = false;
+    for (const BenchmarkResult& benchmark : benchmarks) {
+        if (benchmark.mode == "Sequential C++ baseline") {
+            report << "    \"sequential_runtime_ms\": " << benchmark.runtime_ms << ",\n"
+                << "    \"sequential_throughput_mps\": "
+                << benchmark.throughput_mps << ",\n";
+            has_baseline = true;
+            break;
+        }
+    }
+    if (!has_baseline) {
+        report << "    \"sequential_runtime_ms\": null,\n"
+            << "    \"sequential_throughput_mps\": null,\n";
+    }
+    report << "    \"openmp_runs\": [";
+    bool first_openmp_run = true;
+    for (const BenchmarkResult& benchmark : benchmarks) {
+        if (benchmark.mode != "OpenMP") {
+            continue;
+        }
+        report << (first_openmp_run ? "\n" : ",\n")
+            << "      { \"threads\": " << benchmark.threads
+            << ", \"runtime_ms\": " << benchmark.runtime_ms
+            << ", \"speedup\": " << benchmark.speedup
+            << ", \"parallel_efficiency_percent\": "
+            << benchmark.parallel_efficiency_percent
+            << ", \"throughput_mps\": " << benchmark.throughput_mps
+            << ", \"verification_passed\": "
+            << (benchmark.verification_passed ? "true" : "false")
+            << ", \"mismatched_pixels\": " << benchmark.mismatched_pixels
+            << ", \"semantic_mismatched_pixels\": "
+            << benchmark.semantic_mismatched_pixels
+            << " }";
+        first_openmp_run = false;
+    }
+    if (!first_openmp_run) {
+        report << '\n';
+    }
+    report << "    ],\n"
+        << "    \"timed_stages\": \"shared pair normalization, Lee despeckling, threshold selection, water segmentation, change detection, and cleanup\",\n"
+        << "    \"throughput_definition\": \"both input images in megapixels per second\"\n"
         << "  }\n"
         << "}\n";
     if (!report) {
@@ -554,6 +598,7 @@ bool write_flood_csv_report(
     float pre_threshold,
     float post_threshold,
     int minimum_patch_pixels,
+    const std::vector<BenchmarkResult>& benchmarks,
     std::string& error) {
     if (width <= 0 || height <= 0 || minimum_patch_pixels <= 0 ||
         !std::isfinite(metadata.pixel_size_x_m) ||
@@ -618,6 +663,21 @@ bool write_flood_csv_report(
         << kLeeEquivalentLooks << ",\n"
         << "processing_parameters,cleanup,"
         << csv_escape("3x3 opening, 3x3 closing, 8-connected component filter") << ",\n";
+    for (const BenchmarkResult& benchmark : benchmarks) {
+        report << "benchmark," << csv_escape(benchmark.mode) << ","
+            << benchmark.runtime_ms << ",ms\n"
+            << "benchmark,threads," << benchmark.threads << ",threads\n"
+            << "benchmark,speedup," << benchmark.speedup << ",x\n"
+            << "benchmark,parallel_efficiency,"
+            << benchmark.parallel_efficiency_percent << ",percent\n"
+            << "benchmark,throughput," << benchmark.throughput_mps << ",MP/s\n"
+            << "benchmark,verification,"
+            << (benchmark.verification_passed ? "PASSED" : "FAILED") << ",\n"
+            << "benchmark,mismatched_pixels,"
+            << benchmark.mismatched_pixels << ",pixels\n"
+            << "benchmark,semantic_mismatched_pixels,"
+            << benchmark.semantic_mismatched_pixels << ",pixels\n";
+    }
     if (!report) {
         error = "Failed while writing flood CSV report: " + output_path;
         return false;
@@ -625,10 +685,184 @@ bool write_flood_csv_report(
     return true;
 }
 
+bool append_benchmark_results(
+    const std::string& output_path,
+    const std::vector<BenchmarkResult>& benchmarks,
+    std::string& error) {
+    for (const BenchmarkResult& benchmark : benchmarks) {
+        if (benchmark.width <= 0 || benchmark.height <= 0 ||
+            !std::isfinite(benchmark.runtime_ms) || benchmark.runtime_ms <= 0.0 ||
+            !std::isfinite(benchmark.throughput_mps) ||
+            !std::isfinite(benchmark.speedup) ||
+            !std::isfinite(benchmark.parallel_efficiency_percent) ||
+            benchmark.threads < 0) {
+            error = "Cannot append invalid benchmark metrics.";
+            return false;
+        }
+    }
+
+    const std::string header =
+        "mode,resolution,runtime_ms,throughput_mps,threads,speedup,"
+        "parallel_efficiency_percent,verification,mismatched_flood_pixels,"
+        "mismatched_semantic_pixels";
+    const auto write_benchmark_rows = [&](std::ostream& csv) {
+        csv << std::setprecision(15);
+        for (const BenchmarkResult& benchmark : benchmarks) {
+            csv << csv_escape(benchmark.mode) << ","
+                << benchmark.width << "x" << benchmark.height << ","
+                << benchmark.runtime_ms << ","
+                << benchmark.throughput_mps << ","
+                << benchmark.threads << ","
+                << benchmark.speedup << ","
+                << benchmark.parallel_efficiency_percent << ","
+                << (benchmark.verification_checked
+                    ? (benchmark.verification_passed ? "PASSED" : "FAILED")
+                    : "N/A") << ","
+                << (benchmark.verification_checked
+                    ? std::to_string(benchmark.mismatched_pixels)
+                    : std::string()) << ","
+                << (benchmark.verification_checked
+                    ? std::to_string(benchmark.semantic_mismatched_pixels)
+                    : std::string()) << "\n";
+        }
+    };
+
+    const std::filesystem::path csv_path(output_path);
+    std::error_code filesystem_error;
+    if (!csv_path.parent_path().empty()) {
+        std::filesystem::create_directories(
+            csv_path.parent_path(), filesystem_error);
+        if (filesystem_error) {
+            error = "Unable to create benchmark CSV directory: " +
+                filesystem_error.message();
+            return false;
+        }
+    }
+
+    std::ifstream existing_file(output_path);
+    if (!existing_file) {
+        std::ofstream csv(output_path, std::ios::out | std::ios::trunc);
+        if (!csv) {
+            error = "Unable to create benchmark results CSV: " + output_path;
+            return false;
+        }
+        csv << header << '\n';
+        write_benchmark_rows(csv);
+        if (!csv) {
+            error = "Failed while writing benchmark results CSV: " + output_path;
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<std::string> existing_lines;
+    std::string line;
+    while (std::getline(existing_file, line)) {
+        if (!line.empty()) {
+            existing_lines.push_back(line);
+        }
+    }
+    if (existing_file.bad()) {
+        error = "Unable to read existing benchmark results CSV: " + output_path;
+        return false;
+    }
+    existing_file.close();
+    if (!existing_lines.empty() && existing_lines.front() == header) {
+        std::ofstream csv(output_path, std::ios::out | std::ios::app);
+        if (!csv) {
+            error = "Unable to open benchmark results CSV for appending: " + output_path;
+            return false;
+        }
+        write_benchmark_rows(csv);
+        if (!csv) {
+            error = "Failed while appending benchmark results CSV: " + output_path;
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<std::string> migrated_rows;
+    migrated_rows.reserve(existing_lines.size());
+    for (const std::string& existing_line : existing_lines) {
+        std::istringstream row_stream(existing_line);
+        std::vector<std::string> fields;
+        std::string field;
+        while (std::getline(row_stream, field, ',')) {
+            fields.push_back(field);
+        }
+        if (fields.size() != 4) {
+            error = "Existing benchmark CSV has an unsupported row; refusing to rewrite it.";
+            return false;
+        }
+        const std::size_t separator = fields[1].find('x');
+        if (separator == std::string::npos) {
+            error = "Existing benchmark CSV has an invalid resolution; refusing to rewrite it.";
+            return false;
+        }
+        migrated_rows.push_back(
+            csv_escape(fields[0]) + "," + fields[1] + "," +
+            fields[2] + "," + fields[3] + ",,,,,,\n");
+    }
+
+    const std::filesystem::path temporary_path =
+        csv_path.string() + ".phase8.tmp";
+    const std::filesystem::path backup_path =
+        csv_path.string() + ".phase8.bak";
+    if (std::filesystem::exists(temporary_path) ||
+        std::filesystem::exists(backup_path)) {
+        error = "Temporary benchmark CSV migration files already exist; refusing to overwrite them.";
+        return false;
+    }
+
+    {
+        std::ofstream temporary(temporary_path, std::ios::out | std::ios::trunc);
+        if (!temporary) {
+            error = "Unable to create temporary benchmark CSV: " +
+                temporary_path.string();
+            return false;
+        }
+        temporary << header << '\n';
+        for (const std::string& migrated_row : migrated_rows) {
+            temporary << migrated_row;
+        }
+        write_benchmark_rows(temporary);
+        if (!temporary) {
+            error = "Failed while creating migrated benchmark CSV.";
+            temporary.close();
+            std::filesystem::remove(temporary_path, filesystem_error);
+            return false;
+        }
+    }
+
+    std::filesystem::rename(csv_path, backup_path, filesystem_error);
+    if (filesystem_error) {
+        error = "Unable to preserve the existing benchmark CSV during migration: " +
+            filesystem_error.message();
+        std::filesystem::remove(temporary_path, filesystem_error);
+        return false;
+    }
+    std::filesystem::rename(temporary_path, csv_path, filesystem_error);
+    if (filesystem_error) {
+        const std::string rename_error = filesystem_error.message();
+        std::error_code restore_error;
+        std::filesystem::rename(backup_path, csv_path, restore_error);
+        std::filesystem::remove(temporary_path, restore_error);
+        error = "Unable to install migrated benchmark CSV: " + rename_error;
+        return false;
+    }
+    std::filesystem::remove(backup_path, filesystem_error);
+    if (filesystem_error) {
+        error = "Benchmark CSV was updated, but its migration backup could not be removed: " +
+            filesystem_error.message();
+        return false;
+    }
+    return true;
+}
+
 void log_performance(const std::string& mode, int width, int height, double execution_time_ms, double baseline_time_ms) {
-    double total_pixels = static_cast<double>(width) * height;
-    double time_sec = execution_time_ms / 1000.0;
-    double megapixels_per_sec = (total_pixels / 1e6) / time_sec;
+    const double total_pixels = static_cast<double>(width) * height;
+    const double time_sec = execution_time_ms / 1000.0;
+    const double megapixels_per_sec = (total_pixels / 1e6) / time_sec;
 
     std::cout << "\n------------------------------------------" << std::endl;
     std::cout << " Execution Mode: " << mode << std::endl;
@@ -637,13 +871,46 @@ void log_performance(const std::string& mode, int width, int height, double exec
     std::cout << " Throughput:     " << megapixels_per_sec << " MP/s" << std::endl;
 
     if (baseline_time_ms > 0.0) {
-        double speedup = baseline_time_ms / execution_time_ms;
+        const double speedup = baseline_time_ms / execution_time_ms;
         std::cout << " Speedup:        " << speedup << "x" << std::endl;
     }
     std::cout << "------------------------------------------" << std::endl;
 
-    // Log data into CSV
-    std::ofstream csv("docs/benchmark_results.csv", std::ios::app);
-    csv << mode << "," << width << "x" << height << "," << execution_time_ms << "," << megapixels_per_sec << "\n";
-    csv.close();
+    int threads = 0;
+    const std::size_t opening = mode.find('(');
+    if (opening != std::string::npos) {
+        std::size_t digit = opening + 1;
+        while (digit < mode.size() &&
+            (mode[digit] < '0' || mode[digit] > '9')) {
+            ++digit;
+        }
+        if (digit < mode.size()) {
+            try {
+                threads = std::stoi(mode.substr(digit));
+            } catch (const std::exception&) {
+                threads = 0;
+            }
+        }
+    }
+
+    const double speedup = baseline_time_ms > 0.0
+        ? baseline_time_ms / execution_time_ms
+        : 1.0;
+    const double efficiency = threads > 0
+        ? speedup / static_cast<double>(threads) * 100.0
+        : 0.0;
+    BenchmarkResult result;
+    result.mode = mode;
+    result.width = width;
+    result.height = height;
+    result.threads = threads;
+    result.runtime_ms = execution_time_ms;
+    result.speedup = speedup;
+    result.parallel_efficiency_percent = efficiency;
+    result.throughput_mps = megapixels_per_sec;
+    std::string error;
+    if (!append_benchmark_results(
+            "docs/benchmark_results.csv", {result}, error)) {
+        std::cerr << "Error: " << error << std::endl;
+    }
 }

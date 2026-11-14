@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <limits>
 #include <cmath>
+#include <chrono>
+#include <stdexcept>
 #include <filesystem>
 #include <sstream>
 #include <vector>
@@ -20,23 +22,136 @@
 
 namespace {
 
+struct FloodPipelineResult {
+    cv::Mat pre_normalized;
+    cv::Mat post_normalized;
+    cv::Mat pre_despeckled;
+    cv::Mat post_despeckled;
+    cv::Mat pre_water_mask;
+    cv::Mat post_water_mask;
+    cv::Mat flood_mask;
+    cv::Mat semantic_map;
+    float pre_threshold = 0.0f;
+    float post_threshold = 0.0f;
+};
+
+void run_flood_pipeline(
+    const cv::Mat& pre_intensity,
+    const cv::Mat& post_intensity,
+    bool use_openmp,
+    int thread_count,
+    bool auto_threshold,
+    float manual_threshold,
+    int minimum_patch_pixels,
+    FloodPipelineResult& result) {
+    std::string normalization_error;
+    if (!normalize_sar_pair(
+            pre_intensity, post_intensity,
+            result.pre_normalized, result.post_normalized,
+            normalization_error)) {
+        throw std::runtime_error(normalization_error);
+    }
+
+    if (use_openmp) {
+        process_lee_openmp(
+            result.pre_normalized, result.pre_despeckled, thread_count);
+        process_lee_openmp(
+            result.post_normalized, result.post_despeckled, thread_count);
+    } else {
+        process_lee_sequential(
+            result.pre_normalized, result.pre_despeckled);
+        process_lee_sequential(
+            result.post_normalized, result.post_despeckled);
+    }
+
+    result.pre_threshold = auto_threshold
+        ? compute_otsu_threshold(result.pre_despeckled)
+        : manual_threshold;
+    result.post_threshold = auto_threshold
+        ? compute_otsu_threshold(result.post_despeckled)
+        : manual_threshold;
+
+    if (use_openmp) {
+        segment_water_openmp(
+            result.pre_despeckled, result.pre_water_mask,
+            result.pre_threshold, thread_count);
+        segment_water_openmp(
+            result.post_despeckled, result.post_water_mask,
+            result.post_threshold, thread_count);
+        detect_flood_change_openmp(
+            result.pre_water_mask, result.post_water_mask,
+            result.flood_mask, result.semantic_map, thread_count);
+        cleanup_flood_openmp(
+            result.flood_mask, result.semantic_map,
+            minimum_patch_pixels, thread_count);
+    } else {
+        segment_water_sequential(
+            result.pre_despeckled, result.pre_water_mask,
+            result.pre_threshold);
+        segment_water_sequential(
+            result.post_despeckled, result.post_water_mask,
+            result.post_threshold);
+        detect_flood_change_sequential(
+            result.pre_water_mask, result.post_water_mask,
+            result.flood_mask, result.semantic_map);
+        cleanup_flood_sequential(
+            result.flood_mask, result.semantic_map,
+            minimum_patch_pixels);
+    }
+}
+
+std::uint64_t count_mismatched_pixels(
+    const cv::Mat& expected,
+    const cv::Mat& actual) {
+    if (expected.empty() || actual.empty() ||
+        expected.type() != CV_8UC1 || actual.type() != CV_8UC1 ||
+        expected.size() != actual.size()) {
+        throw std::invalid_argument(
+            "Equivalence check requires matching, non-empty CV_8UC1 masks.");
+    }
+
+    std::uint64_t mismatches = 0;
+    for (int y = 0; y < expected.rows; ++y) {
+        const std::uint8_t* expected_row =
+            expected.ptr<std::uint8_t>(y);
+        const std::uint8_t* actual_row =
+            actual.ptr<std::uint8_t>(y);
+        for (int x = 0; x < expected.cols; ++x) {
+            mismatches += expected_row[x] != actual_row[x] ? 1U : 0U;
+        }
+    }
+    return mismatches;
+}
+
+double pipeline_throughput_mps(
+    int width,
+    int height,
+    double runtime_ms) {
+    const double input_megapixels =
+        2.0 * static_cast<double>(width) * height / 1'000'000.0;
+    return input_megapixels / (runtime_ms / 1000.0);
+}
+
 void print_usage(const char* executable) {
     std::cout
         << "Usage:\n"
         << "  " << executable << " [image_path] [--threads N] [--resolution WIDTHxHEIGHT] "
            "[--pixel-size meters] [--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --pre <path> --post <path> [--threads N] "
+           "[--benchmark] "
            "[--threshold value | --auto-threshold] "
            "[--min-patch-pixels N] [--pixel-size meters] "
            "[--origin-lat deg --origin-lon deg]\n"
         << "  " << executable << " --help\n\n"
         << "Legacy single-image mode runs the Gaussian+Sobel benchmark.\n"
         << "Paired-image mode normalizes and despeckles both images, segments water, "
-           "detects and cleans flood zones, and writes binary and semantic maps.\n"
+           "detects and cleans flood zones, verifies sequential/OpenMP results, "
+           "and writes maps and area/benchmark reports.\n"
         << "Options:\n"
         << "  --pre <path>                 Pre-flood image (requires --post)\n"
         << "  --post <path>                Post-flood image (requires --pre)\n"
-        << "  --threads N                  OpenMP thread count (legacy benchmark)\n"
+        << "  --threads N                  Use one OpenMP thread count for this run\n"
+        << "  --benchmark                  Sweep OpenMP thread counts 1, 2, 4, 8, 16\n"
         << "  --resolution WIDTHxHEIGHT    Resize legacy single-image input\n"
         << "  --threshold value            Manual dark-water threshold on [0, 1] (default 0.25)\n"
         << "  --auto-threshold             Compute an Otsu threshold independently per image\n"
@@ -165,6 +280,9 @@ int main(int argc, char** argv) {
     std::string pre_path;
     std::string post_path;
     std::vector<int> threads_to_test = {2, 4, 8, 16};
+    std::vector<int> flood_threads_to_test = {1, 2, 4, 8, 16};
+    bool benchmark_requested = false;
+    bool threads_overridden = false;
     int target_width = 0;
     int target_height = 0;
     bool has_positional_input = false;
@@ -187,6 +305,10 @@ int main(int argc, char** argv) {
             return 0;
         } else if (arg == "--auto-threshold") {
             auto_threshold = true;
+        } else if (arg == "--benchmark") {
+            benchmark_requested = true;
+            threads_to_test = {1, 2, 4, 8, 16};
+            flood_threads_to_test = {1, 2, 4, 8, 16};
         } else if (arg == "--pre" || arg == "--post" || arg == "--threads" ||
             arg == "--resolution" || arg == "--pixel-size" ||
             arg == "--origin-lat" || arg == "--origin-lon" ||
@@ -209,6 +331,8 @@ int main(int argc, char** argv) {
                     return 2;
                 }
                 threads_to_test = {requested_threads};
+                flood_threads_to_test = {requested_threads};
+                threads_overridden = true;
             } else if (arg == "--resolution") {
                 const size_t separator = value.find('x');
                 if (separator == std::string::npos ||
@@ -293,21 +417,16 @@ int main(int argc, char** argv) {
         std::cerr << "Error: --threshold and --auto-threshold cannot be used together.\n";
         return 2;
     }
+    if (benchmark_requested && threads_overridden) {
+        std::cerr << "Error: Use either --benchmark or --threads N, not both.\n";
+        return 2;
+    }
 
     if (has_pre_path) {
         cv::Mat pre_intensity;
         cv::Mat post_intensity;
         std::string error;
         if (!load_image_pair(pre_path, post_path, pre_intensity, post_intensity, error)) {
-            std::cerr << "Error: " << error << std::endl;
-            return 1;
-        }
-
-        cv::Mat pre_normalized;
-        cv::Mat post_normalized;
-        if (!normalize_sar_pair(
-                pre_intensity, post_intensity,
-                pre_normalized, post_normalized, error)) {
             std::cerr << "Error: " << error << std::endl;
             return 1;
         }
@@ -333,104 +452,109 @@ int main(int argc, char** argv) {
                   << kLeeEquivalentLooks << ").\n";
         print_spatial_summary(pre_intensity.cols, pre_intensity.rows, metadata);
 
-        cv::Mat pre_sequential;
-        cv::Mat post_sequential;
-        Timer preprocessing_timer;
-        preprocessing_timer.start();
-        process_lee_sequential(pre_normalized, pre_sequential);
-        process_lee_sequential(post_normalized, post_sequential);
-        const double sequential_time_ms = preprocessing_timer.stop_ms();
-        std::cout << "Sequential Lee filtering (pre + post): "
-                  << sequential_time_ms << " ms.\n";
+        std::vector<BenchmarkResult> benchmark_results;
+        const auto sequential_start = std::chrono::steady_clock::now();
+        FloodPipelineResult sequential_result;
+        try {
+            run_flood_pipeline(
+                pre_intensity, post_intensity, false, 1,
+                auto_threshold, water_threshold,
+                minimum_patch_pixels, sequential_result);
+        } catch (const std::exception& exception) {
+            std::cerr << "Error: Sequential flood pipeline failed: "
+                      << exception.what() << std::endl;
+            return 1;
+        }
+        const double sequential_time_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - sequential_start).count();
 
-        float pre_active_threshold = water_threshold;
-        float post_active_threshold = water_threshold;
+        cv::Mat pre_sequential = sequential_result.pre_despeckled;
+        cv::Mat post_sequential = sequential_result.post_despeckled;
+        cv::Mat pre_normalized = sequential_result.pre_normalized;
+        cv::Mat post_normalized = sequential_result.post_normalized;
+        cv::Mat pre_water_mask = sequential_result.pre_water_mask;
+        cv::Mat post_water_mask = sequential_result.post_water_mask;
+        cv::Mat new_flood_mask = sequential_result.flood_mask;
+        cv::Mat semantic_map = sequential_result.semantic_map;
+        const float pre_active_threshold = sequential_result.pre_threshold;
+        const float post_active_threshold = sequential_result.post_threshold;
+        const int image_width = pre_intensity.cols;
+        const int image_height = pre_intensity.rows;
+        const double sequential_throughput =
+            pipeline_throughput_mps(image_width, image_height, sequential_time_ms);
+        benchmark_results.push_back({
+            "Sequential C++ baseline", pre_path, post_path,
+            image_width, image_height, 1, sequential_time_ms,
+            1.0, 100.0, sequential_throughput, true, true, 0, 0});
+
+        std::cout << std::fixed << std::setprecision(6)
+                  << "Sequential C++ complete flood pipeline: "
+                  << sequential_time_ms << " ms; throughput: "
+                  << sequential_throughput << " MP/s (both inputs).\n";
         if (auto_threshold) {
-            pre_active_threshold = compute_otsu_threshold(pre_sequential);
-            post_active_threshold = compute_otsu_threshold(post_sequential);
             std::cout << "Automatic Otsu thresholds (dark water, <=): pre="
-                      << pre_active_threshold << ", post=" << post_active_threshold << ".\n";
+                      << pre_active_threshold << ", post="
+                      << post_active_threshold << ".\n";
         } else {
             std::cout << "Manual dark-water threshold (<=): "
                       << water_threshold << ".\n";
         }
 
-        cv::Mat pre_water_mask;
-        cv::Mat post_water_mask;
-        segment_water_sequential(
-            pre_sequential, pre_water_mask, pre_active_threshold);
-        segment_water_sequential(
-            post_sequential, post_water_mask, post_active_threshold);
-
-        cv::Mat new_flood_mask;
-        cv::Mat semantic_map;
-        detect_flood_change_sequential(
-            pre_water_mask, post_water_mask, new_flood_mask, semantic_map);
-        Timer cleanup_timer;
-        cleanup_timer.start();
-        cleanup_flood_sequential(
-            new_flood_mask, semantic_map, minimum_patch_pixels);
-        const double sequential_cleanup_ms = cleanup_timer.stop_ms();
-        std::cout << "Sequential morphology + connected-component cleanup: "
-                  << sequential_cleanup_ms << " ms (minimum patch: "
-                  << minimum_patch_pixels << " pixels).\n";
-
-        cv::Mat pre_openmp;
-        cv::Mat post_openmp;
-        cv::Mat pre_openmp_mask;
-        cv::Mat post_openmp_mask;
-        cv::Mat openmp_flood_mask;
-        cv::Mat openmp_semantic_map;
-        for (int thread_count : threads_to_test) {
-            preprocessing_timer.start();
-            process_lee_openmp(pre_normalized, pre_openmp, thread_count);
-            process_lee_openmp(post_normalized, post_openmp, thread_count);
-            const double openmp_time_ms = preprocessing_timer.stop_ms();
-            const double pre_difference =
-                cv::norm(pre_sequential, pre_openmp, cv::NORM_INF);
-            const double post_difference =
-                cv::norm(post_sequential, post_openmp, cv::NORM_INF);
-            const double max_difference = std::max(pre_difference, post_difference);
-            std::cout << "OpenMP Lee filtering (" << thread_count
-                      << " threads, pre + post): " << openmp_time_ms
-                      << " ms; max abs. difference from sequential: "
-                      << std::scientific << max_difference << std::fixed << ".\n";
-            if (max_difference != 0.0) {
-                std::cerr << "Error: Sequential and OpenMP Lee outputs do not match exactly.\n";
+        bool all_equivalence_checks_passed = true;
+        for (int thread_count : flood_threads_to_test) {
+            const auto openmp_start = std::chrono::steady_clock::now();
+            FloodPipelineResult openmp_result;
+            try {
+                run_flood_pipeline(
+                    pre_intensity, post_intensity, true, thread_count,
+                    auto_threshold, water_threshold,
+                    minimum_patch_pixels, openmp_result);
+            } catch (const std::exception& exception) {
+                std::cerr << "Error: OpenMP flood pipeline failed with "
+                          << thread_count << " threads: "
+                          << exception.what() << std::endl;
                 return 1;
             }
+            const double openmp_time_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - openmp_start).count();
+            const std::uint64_t flood_mismatches =
+                count_mismatched_pixels(new_flood_mask, openmp_result.flood_mask);
+            const std::uint64_t semantic_mismatches =
+                count_mismatched_pixels(semantic_map, openmp_result.semantic_map);
+            const bool verification_passed =
+                flood_mismatches == 0 && semantic_mismatches == 0;
+            all_equivalence_checks_passed =
+                all_equivalence_checks_passed && verification_passed;
+            const double speedup = sequential_time_ms / openmp_time_ms;
+            const double efficiency =
+                speedup / static_cast<double>(thread_count) * 100.0;
+            const double throughput =
+                pipeline_throughput_mps(image_width, image_height, openmp_time_ms);
+            benchmark_results.push_back({
+                "OpenMP", pre_path, post_path,
+                image_width, image_height, thread_count, openmp_time_ms,
+                speedup, efficiency, throughput, true, verification_passed,
+                flood_mismatches, semantic_mismatches});
 
-            segment_water_openmp(
-                pre_openmp, pre_openmp_mask, pre_active_threshold, thread_count);
-            segment_water_openmp(
-                post_openmp, post_openmp_mask, post_active_threshold, thread_count);
-            const double pre_mask_difference =
-                cv::norm(pre_water_mask, pre_openmp_mask, cv::NORM_INF);
-            const double post_mask_difference =
-                cv::norm(post_water_mask, post_openmp_mask, cv::NORM_INF);
-            if (pre_mask_difference != 0.0 || post_mask_difference != 0.0) {
-                std::cerr << "Error: Sequential and OpenMP water masks do not match exactly.\n";
-                return 1;
-            }
-
-            detect_flood_change_openmp(
-                pre_openmp_mask, post_openmp_mask,
-                openmp_flood_mask, openmp_semantic_map, thread_count);
-            cleanup_timer.start();
-            cleanup_flood_openmp(
-                openmp_flood_mask, openmp_semantic_map,
-                minimum_patch_pixels, thread_count);
-            const double openmp_cleanup_ms = cleanup_timer.stop_ms();
-            std::cout << "OpenMP morphology + connected-component cleanup ("
-                      << thread_count << " threads): " << openmp_cleanup_ms
-                      << " ms.\n";
-            if (cv::norm(new_flood_mask, openmp_flood_mask, cv::NORM_INF) != 0.0 ||
-                cv::norm(semantic_map, openmp_semantic_map, cv::NORM_INF) != 0.0) {
-                std::cerr << "Error: Sequential and OpenMP flood/class maps do not match exactly.\n";
-                return 1;
+            std::cout << "OpenMP complete flood pipeline (" << thread_count
+                      << " threads): " << openmp_time_ms
+                      << " ms; speedup: " << speedup
+                      << "x; parallel efficiency: " << efficiency
+                      << "%; throughput: " << throughput << " MP/s.\n";
+            if (verification_passed) {
+                std::cout << "Verification: PASSED (0 mismatched pixels)\n";
+            } else {
+                std::cerr << "Verification: FAILED (" << flood_mismatches
+                          << " mismatched flood pixels; "
+                          << semantic_mismatches
+                          << " mismatched semantic pixels).\n";
             }
         }
 
+        Timer preprocessing_timer;
+        Timer cleanup_timer;
 #ifdef USE_CUDA
         try {
             cv::Mat pre_cuda;
@@ -539,7 +663,7 @@ int main(int argc, char** argv) {
                 pre_intensity.cols, pre_intensity.rows, metadata,
                 area_statistics, auto_threshold,
                 pre_active_threshold, post_active_threshold,
-                minimum_patch_pixels, error)) {
+                minimum_patch_pixels, benchmark_results, error)) {
             std::cerr << "Error: " << error << std::endl;
             return 1;
         }
@@ -548,7 +672,12 @@ int main(int argc, char** argv) {
                 pre_intensity.cols, pre_intensity.rows, metadata,
                 area_statistics, auto_threshold,
                 pre_active_threshold, post_active_threshold,
-                minimum_patch_pixels, error)) {
+                minimum_patch_pixels, benchmark_results, error)) {
+            std::cerr << "Error: " << error << std::endl;
+            return 1;
+        }
+        if (!append_benchmark_results(
+                "docs/benchmark_results.csv", benchmark_results, error)) {
             std::cerr << "Error: " << error << std::endl;
             return 1;
         }
@@ -575,7 +704,7 @@ int main(int argc, char** argv) {
                      "data/output/flood_overlay.png, and "
                      "data/output/flood_report.json and "
                      "data/output/flood_report.csv.\n";
-        return 0;
+        return all_equivalence_checks_passed ? 0 : 1;
     }
 
     cv::Mat input = cv::imread(input_path, cv::IMREAD_GRAYSCALE);

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <fstream>
+#include <vector>
 #include <opencv2/opencv.hpp>
 
 class Timer {
@@ -68,6 +69,23 @@ struct FloodAreaStatistics {
     double receded_water_km2 = 0.0;
 };
 
+struct BenchmarkResult {
+    std::string mode;
+    std::string pre_image_path;
+    std::string post_image_path;
+    int width = 0;
+    int height = 0;
+    int threads = 0;
+    double runtime_ms = 0.0;
+    double speedup = 0.0;
+    double parallel_efficiency_percent = 0.0;
+    double throughput_mps = 0.0;
+    bool verification_checked = false;
+    bool verification_passed = false;
+    std::uint64_t mismatched_pixels = 0;
+    std::uint64_t semantic_mismatched_pixels = 0;
+};
+
 bool load_spatial_metadata(
     const std::string& image_path,
     double configured_pixel_size_m,
@@ -94,6 +112,7 @@ bool write_flood_report(
     float pre_threshold,
     float post_threshold,
     int minimum_patch_pixels,
+    const std::vector<BenchmarkResult>& benchmarks,
     std::string& error);
 bool write_flood_csv_report(
     const std::string& output_path,
@@ -107,6 +126,11 @@ bool write_flood_csv_report(
     float pre_threshold,
     float post_threshold,
     int minimum_patch_pixels,
+    const std::vector<BenchmarkResult>& benchmarks,
+    std::string& error);
+bool append_benchmark_results(
+    const std::string& output_path,
+    const std::vector<BenchmarkResult>& benchmarks,
     std::string& error);
 
 #endif
